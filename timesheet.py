@@ -48,6 +48,7 @@ class TaskTimerApp:
         self.updateLoop()
 
         self.root.bind("<Delete>", self.deleteSelected)
+        self.root.protocol("WM_DELETE_WINDOW", self.onClose)
 
     def getBaseDir(self):
         return os.path.dirname(os.path.abspath(sys.argv[0]))
@@ -375,6 +376,59 @@ class TaskTimerApp:
                 timeLabel.config(text=text)
         self.root.after(50, self.updateLoop)
 
+    def _parseSummaryText(self, text):
+        agg = {}
+        total = 0.0
+        for line in text.splitlines():
+            if ":" not in line:
+                continue
+            name, rest = line.split(":", 1)
+            name = name.strip()
+            rest = rest.strip()
+            if not rest:
+                continue
+            token = rest.split()[0]
+            try:
+                hours = float(token)
+            except ValueError:
+                continue
+            if name.lower() == "total":
+                continue
+            agg[name] = agg.get(name, 0.0) + hours
+            total += hours
+        return agg, total
+
+    def _mergeSummaryForDate(self, dateKey, newSummary):
+        existing = self.history.get(dateKey)
+        if not existing:
+            return newSummary
+
+        resp = messagebox.askyesnocancel(
+            "Existing summary",
+            "A summary already exists for this date.\n\n"
+            "Yes  = append times\n"
+            "No   = overwrite\n"
+            "Cancel = keep existing and abort."
+        )
+        if resp is None:  # Cancel
+            return None
+        if resp is False:  # Overwrite
+            return newSummary
+
+        newAgg, _ = self._parseSummaryText(newSummary)
+        oldAgg, _ = self._parseSummaryText(existing)
+
+        combined = dict(oldAgg)
+        for name, hours in newAgg.items():
+            combined[name] = combined.get(name, 0.0) + hours
+
+        totalHours = sum(combined.values())
+        lines = []
+        for name, hours in sorted(combined.items(), key=lambda kv: kv[0].lower()):
+            lines.append(f"{name}: {hours:.1f} h")
+        lines.append(f"Total: {totalHours:.1f} h")
+        return "\n".join(lines)
+
     def endDay(self):
         now = time.time()
 
@@ -401,21 +455,25 @@ class TaskTimerApp:
             lines.append(f"{name}: {rounded:.1f} h")
 
         if self.unassignedSeconds > 0:
-            un_hours = self.unassignedSeconds / 3600.0
-            un_rounded = round(un_hours, 1)
-            totalHours += un_rounded
-            lines.append(f"Untasked: {un_rounded:.1f} h")
+            unHours = self.unassignedSeconds / 3600.0
+            unRounded = round(unHours, 1)
+            totalHours += unRounded
+            lines.append(f"Untasked: {unRounded:.1f} h")
 
         lines.append(f"Total: {totalHours:.1f} h")
         summary = "\n".join(lines)
 
         todayKey = date.today().isoformat()
-        self.history[todayKey] = summary
+        merged = self._mergeSummaryForDate(todayKey, summary)
+        if merged is None:
+            return  # user canceled
+
+        self.history[todayKey] = merged
         self.saveData()
 
         self.root.clipboard_clear()
-        self.root.clipboard_append(summary)
-        messagebox.showinfo("Summary (copied to clipboard)", summary)
+        self.root.clipboard_append(merged)
+        messagebox.showinfo("Summary (copied to clipboard)", merged)
 
     def createDragGhost(self, name):
         if name not in self.rows:
@@ -506,6 +564,50 @@ class TaskTimerApp:
         self.dragCurrentIndex = targetIndex
         self.relayoutRows()
 
+    def onClose(self):
+        now = time.time()
+
+        if self.currentTask is not None and self.currentStart is not None:
+            elapsed = now - self.currentStart
+            self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
+            self.currentTask = None
+            self.currentStart = None
+            self.refreshRowStyles()
+
+        self.stopUnassigned(now)
+
+        hasTime = any(sec > 0 for sec in self.tasks.values()) or self.unassignedSeconds > 0
+
+        if hasTime:
+            lines = []
+            totalHours = 0.0
+
+            for name, seconds in self.tasks.items():
+                hours = seconds / 3600.0
+                rounded = round(hours, 1)
+                totalHours += rounded
+                lines.append(f"{name}: {rounded:.1f} h")
+
+            if self.unassignedSeconds > 0:
+                unHours = self.unassignedSeconds / 3600.0
+                unRounded = round(unHours, 1)
+                totalHours += unRounded
+                lines.append(f"Untasked: {unRounded:.1f} h")
+
+            lines.append(f"Total: {totalHours:.1f} h")
+            summary = "\n".join(lines)
+
+            todayKey = date.today().isoformat()
+            merged = self._mergeSummaryForDate(todayKey, summary)
+            if merged is None:
+                # user hit Cancel -> don't close, don't lose time
+                return
+
+            self.history[todayKey] = merged
+            self.saveData()
+
+        self.root.destroy()
+
     def endDrag(self, event):
         if self.dragGhost is not None:
             self.dragGhost.destroy()
@@ -594,7 +696,7 @@ class TaskTimerApp:
         histWin = tk.Toplevel(self.root)
         histWin.title("History")
         histWin.configure(bg=self.bgColor)
-        histWin.geometry("740x380")
+        histWin.geometry("900x500")
 
         histWin.columnconfigure(0, weight=0)
         histWin.columnconfigure(1, weight=0)
