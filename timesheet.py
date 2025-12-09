@@ -1000,7 +1000,8 @@ class TaskTimerApp:
             selectforeground="#ffffff",
             borderwidth=0,
             highlightthickness=0,
-            font=("Segoe UI", 10)
+            font=("Segoe UI", 10),
+            selectmode=tk.EXTENDED
         )
         taskListbox.pack(fill="both", expand=True, pady=(4, 8))
 
@@ -1058,20 +1059,82 @@ class TaskTimerApp:
                     lines.append(f"  {t}: {h:.1f} h")
             return lines
 
+        listItems = []  # (type, value) where type is "group" or "task"
+        groupedTasks = {}
+
         def refreshTaskList():
-            nonlocal taskNames
+            nonlocal taskNames, listItems, groupedTasks
             taskNames = collectAllTasks()
-            taskListbox.delete(0, tk.END)
+            listItems = []
+            groupedTasks = {}
+
             for name in taskNames:
                 g = self.groups.get(name)
-                label = f"{name} ({g})" if g else name
-                taskListbox.insert(tk.END, label)
+                if g:
+                    groupedTasks.setdefault(g, []).append(name)
+
+            ungrouped = [name for name in taskNames if not self.groups.get(name)]
+
+            taskListbox.delete(0, tk.END)
+
+            for groupName in sorted(groupedTasks.keys()):
+                listItems.append(("group", groupName))
+                taskListbox.insert(tk.END, groupName)
+                for task in sorted(groupedTasks[groupName]):
+                    listItems.append(("task", task))
+                    taskListbox.insert(tk.END, f"  {task}")
+
+            for task in sorted(ungrouped):
+                listItems.append(("task", task))
+                taskListbox.insert(tk.END, task)
 
         def selectedTaskNames():
             sel = taskListbox.curselection()
             if not sel:
                 return []
-            return [taskNames[i] for i in sel if i < len(taskNames)]
+            selected = []
+            seen = set()
+            for idx in sel:
+                if idx >= len(listItems):
+                    continue
+                itemType, value = listItems[idx]
+                if itemType == "task":
+                    if value not in seen:
+                        selected.append(value)
+                        seen.add(value)
+                else:
+                    for task in groupedTasks.get(value, []):
+                        if task not in seen:
+                            selected.append(task)
+                            seen.add(task)
+            return selected
+
+        def groupForSelection():
+            sel = taskListbox.curselection()
+            if not sel:
+                return None
+
+            groupsFound = set()
+            hasUngrouped = False
+
+            for idx in sel:
+                if idx >= len(listItems):
+                    continue
+                itemType, value = listItems[idx]
+                if itemType == "group":
+                    groupsFound.add(value)
+                else:
+                    g = self.groups.get(value, "")
+                    if g:
+                        groupsFound.add(g)
+                    else:
+                        hasUngrouped = True
+
+            if len(groupsFound) == 1 and not hasUngrouped:
+                return next(iter(groupsFound))
+            if not groupsFound and hasUngrouped:
+                return ""
+            return None
 
         def showPayPeriodSummary():
             ppIdx = current["ppIndex"]
@@ -1170,13 +1233,12 @@ class TaskTimerApp:
             showDaySummary(dayIdx)
 
         def onTaskSelect(event):
-            selTasks = selectedTaskNames()
-            if not selTasks:
-                groupEntry.delete(0, tk.END)
-                return
-            g = self.groups.get(selTasks[0], "") or ""
+            g = groupForSelection()
             groupEntry.delete(0, tk.END)
-            groupEntry.insert(0, g)
+            if g is None:
+                return
+            if g:
+                groupEntry.insert(0, g)
 
         def setGroup():
             groupName = groupEntry.get().strip()
