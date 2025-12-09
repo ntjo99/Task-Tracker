@@ -998,7 +998,6 @@ class TaskTimerApp:
             fg=self.textColor,
             selectbackground=self.accentColor,
             selectforeground="#ffffff",
-            selectmode=tk.EXTENDED,
             borderwidth=0,
             highlightthickness=0,
             font=("Segoe UI", 10)
@@ -1047,39 +1046,16 @@ class TaskTimerApp:
         taskNames = list(allTasks)
 
         def formatLines(total, taskAgg):
-            groupedTotals = {}
-            groupedMembers = {}
-            ungrouped = {}
-
-            for task, hours in taskAgg.items():
-                group = self.groups.get(task)
-                if group:
-                    groupedTotals[group] = groupedTotals.get(group, 0.0) + hours
-                    groupedMembers.setdefault(group, []).append((task, hours))
-                else:
-                    ungrouped[task] = hours
-
+            groupAgg = self._groupAggregates(taskAgg)
             lines = [f"Total: {total:.1f} h"]
-
-            entries = []
-            for g, h in groupedTotals.items():
-                entries.append(("group", g, h))
-            for t, h in ungrouped.items():
-                entries.append(("task", t, h))
-
-            entries.sort(key=lambda item: item[2], reverse=True)
-
-            for kind, name, hours in entries:
-                lines.append(f"{name}: {hours:.1f} h")
-                if kind == "group":
-                    members = sorted(
-                        groupedMembers.get(name, []),
-                        key=lambda kv: kv[1],
-                        reverse=True
-                    )
-                    for task, taskHours in members:
-                        lines.append(f"  • {task}: {taskHours:.1f} h")
-
+            if groupAgg:
+                lines.append("Groups:")
+                for g, h in sorted(groupAgg.items(), key=lambda kv: kv[1], reverse=True):
+                    lines.append(f"  {g}: {h:.1f} h")
+            if taskAgg:
+                lines.append("Tasks:")
+                for t, h in sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True):
+                    lines.append(f"  {t}: {h:.1f} h")
             return lines
 
         def refreshTaskList():
