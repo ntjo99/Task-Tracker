@@ -29,6 +29,7 @@ class TaskTimerApp:
         self.currentTask = None
         self.currentStart = None
         self.history = {}
+        self.groups = {}
 
         self.dragTaskName = None
         self.dragFromIndex = None
@@ -150,6 +151,7 @@ class TaskTimerApp:
             for name in data.get("tasks", []):
                 self.createTaskRow(name)
             self.history = data.get("history", {})
+            self.groups = data.get("groups", {}) or {}
         except Exception:
             self.history = {}
 
@@ -157,7 +159,8 @@ class TaskTimerApp:
         names = list(self.rows.keys())
         data = {
             "tasks": names,
-            "history": self.history
+            "history": self.history,
+            "groups": self.groups
         }
         try:
             with open(self.dataFile, "w", encoding="utf-8") as f:
@@ -405,6 +408,15 @@ class TaskTimerApp:
             agg[name] = agg.get(name, 0.0) + hours
             total += hours
         return agg, total
+
+    def _groupAggregates(self, taskAgg):
+        grouped = {}
+        for task, hours in taskAgg.items():
+            group = self.groups.get(task)
+            if not group:
+                continue
+            grouped[group] = grouped.get(group, 0.0) + hours
+        return grouped
 
     def _mergeSummaryForDate(self, dateKey, newSummary, allowSkip=False):
         existing = self.history.get(dateKey)
@@ -806,6 +818,19 @@ class TaskTimerApp:
                 total += hours
             return agg, total
 
+        def collectAllTasks():
+            names = set()
+            for summary in self.history.values():
+                for line in summary.splitlines():
+                    if ":" not in line:
+                        continue
+                    name, _ = line.split(":", 1)
+                    name = name.strip()
+                    if not name or name.lower() == "total":
+                        continue
+                    names.add(name)
+            return sorted(names)
+
         for p in periods:
             agg = {}
             total = 0.0
@@ -845,6 +870,7 @@ class TaskTimerApp:
         histWin.columnconfigure(0, weight=0)
         histWin.columnconfigure(1, weight=0)
         histWin.columnconfigure(2, weight=1)
+        histWin.columnconfigure(3, weight=0)
         histWin.rowconfigure(0, weight=1)
         histWin.rowconfigure(1, weight=0)
 
@@ -912,26 +938,6 @@ class TaskTimerApp:
         textFrame.rowconfigure(3, weight=1)
         textFrame.columnconfigure(0, weight=1)
 
-        ppSummaryLabel = tk.Label(
-            textFrame,
-            text="Pay Period Overview",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.textColor,
-            bg=self.bgColor
-        )
-        ppSummaryLabel.grid(row=0, column=0, sticky="w")
-
-        ppSummaryBox = tk.Text(
-            textFrame,
-            bg="#1b1f24",
-            fg=self.textColor,
-            wrap="word",
-            borderwidth=0,
-            highlightthickness=0,
-            font=("Segoe UI", 10)
-        )
-        ppSummaryBox.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
-
         daySummaryLabel = tk.Label(
             textFrame,
             text="Daily Summary",
@@ -939,7 +945,7 @@ class TaskTimerApp:
             fg=self.textColor,
             bg=self.bgColor
         )
-        daySummaryLabel.grid(row=2, column=0, sticky="w")
+        daySummaryLabel.grid(row=0, column=0, sticky="w")
 
         daySummaryBox = tk.Text(
             textFrame,
@@ -950,9 +956,122 @@ class TaskTimerApp:
             highlightthickness=0,
             font=("Segoe UI", 10)
         )
-        daySummaryBox.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
+        daySummaryBox.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
+
+        ppSummaryLabel = tk.Label(
+            textFrame,
+            text="Pay Period Overview",
+            font=("Segoe UI", 10, "bold"),
+            fg=self.textColor,
+            bg=self.bgColor
+        )
+        ppSummaryLabel.grid(row=2, column=0, sticky="w")
+
+        ppSummaryBox = tk.Text(
+            textFrame,
+            bg="#1b1f24",
+            fg=self.textColor,
+            wrap="word",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Segoe UI", 10)
+        )
+        ppSummaryBox.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
+
+        groupingFrame = tk.Frame(histWin, bg=self.bgColor)
+        groupingFrame.grid(row=0, column=3, padx=(0, 8), pady=8, sticky="ns")
+
+        groupingLabel = tk.Label(
+            groupingFrame,
+            text="Task Groups",
+            font=("Segoe UI", 10, "bold"),
+            fg=self.textColor,
+            bg=self.bgColor
+        )
+        groupingLabel.pack(anchor="w")
+
+        taskListbox = tk.Listbox(
+            groupingFrame,
+            height=16,
+            width=26,
+            bg="#1b1f24",
+            fg=self.textColor,
+            selectbackground=self.accentColor,
+            selectforeground="#ffffff",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Segoe UI", 10)
+        )
+        taskListbox.pack(fill="both", expand=True, pady=(4, 8))
+
+        groupEntry = tk.Entry(
+            groupingFrame,
+            font=("Segoe UI", 10),
+            bg="#1b1f24",
+            fg=self.textColor,
+            insertbackground=self.textColor,
+            relief="flat"
+        )
+        groupEntry.pack(fill="x", pady=(0, 6))
+
+        groupBtnFrame = tk.Frame(groupingFrame, bg=self.bgColor)
+        groupBtnFrame.pack(anchor="e")
+
+        setGroupBtn = tk.Button(
+            groupBtnFrame,
+            text="Set Group",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat"
+        )
+        setGroupBtn.grid(row=0, column=0, padx=4)
+
+        clearGroupBtn = tk.Button(
+            groupBtnFrame,
+            text="Clear Group",
+            font=("Segoe UI", 9),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat"
+        )
+        clearGroupBtn.grid(row=0, column=1, padx=4)
 
         current = {"ppIndex": 0}
+        allTasks = collectAllTasks()
+        taskNames = list(allTasks)
+
+        def formatLines(total, taskAgg):
+            groupAgg = self._groupAggregates(taskAgg)
+            lines = [f"Total: {total:.1f} h"]
+            if groupAgg:
+                lines.append("Groups:")
+                for g, h in sorted(groupAgg.items(), key=lambda kv: kv[1], reverse=True):
+                    lines.append(f"  {g}: {h:.1f} h")
+            if taskAgg:
+                lines.append("Tasks:")
+                for t, h in sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True):
+                    lines.append(f"  {t}: {h:.1f} h")
+            return lines
+
+        def refreshTaskList():
+            nonlocal taskNames
+            taskNames = collectAllTasks()
+            taskListbox.delete(0, tk.END)
+            for name in taskNames:
+                g = self.groups.get(name)
+                label = f"{name} ({g})" if g else name
+                taskListbox.insert(tk.END, label)
+
+        def selectedTaskNames():
+            sel = taskListbox.curselection()
+            if not sel:
+                return []
+            return [taskNames[i] for i in sel if i < len(taskNames)]
 
         def showPayPeriodSummary():
             ppIdx = current["ppIndex"]
@@ -963,10 +1082,7 @@ class TaskTimerApp:
             agg = p.get("agg", {})
             total = p.get("total", 0.0)
 
-            lines = [f"Total: {total:.1f} h"]
-            if agg:
-                for task, hours in sorted(agg.items(), key=lambda kv: kv[1], reverse=True):
-                    lines.append(f"  {task}: {hours:.1f} h")
+            lines = formatLines(total, agg)
 
             ppSummaryBox.delete("1.0", tk.END)
             ppSummaryBox.insert(tk.END, "\n".join(lines))
@@ -1006,14 +1122,17 @@ class TaskTimerApp:
                 taskAgg[name] = taskAgg.get(name, 0.0) + hours
                 total += hours
 
-            lines = [f"Total: {total:.1f} h"]
-            if taskAgg:
-                for t, h in sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True):
-                    lines.append(f"  {t}: {h:.1f} h")
+            lines = formatLines(total, taskAgg)
 
             daySummaryBox.delete("1.0", tk.END)
             daySummaryBox.insert(tk.END, "\n".join(lines))
 
+
+        def getSelectedDayIdx():
+            sel = dayListbox.curselection()
+            if not sel:
+                return None
+            return sel[0]
 
         def refreshDays():
             dayListbox.delete(0, tk.END)
@@ -1050,11 +1169,50 @@ class TaskTimerApp:
             dayIdx = sel[0]
             showDaySummary(dayIdx)
 
+        def onTaskSelect(event):
+            selTasks = selectedTaskNames()
+            if not selTasks:
+                groupEntry.delete(0, tk.END)
+                return
+            g = self.groups.get(selTasks[0], "") or ""
+            groupEntry.delete(0, tk.END)
+            groupEntry.insert(0, g)
+
+        def setGroup():
+            groupName = groupEntry.get().strip()
+            if not groupName:
+                return
+            for task in selectedTaskNames():
+                self.groups[task] = groupName
+            self.saveData()
+            refreshTaskList()
+            showPayPeriodSummary()
+            dayIdx = getSelectedDayIdx()
+            if dayIdx is not None:
+                showDaySummary(dayIdx)
+
+        def clearGroup():
+            changed = False
+            for task in selectedTaskNames():
+                if task in self.groups:
+                    del self.groups[task]
+                    changed = True
+            if changed:
+                self.saveData()
+                refreshTaskList()
+                showPayPeriodSummary()
+                dayIdx = getSelectedDayIdx()
+                if dayIdx is not None:
+                    showDaySummary(dayIdx)
+
         ppListbox.bind("<<ListboxSelect>>", onPayPeriodSelect)
         dayListbox.bind("<<ListboxSelect>>", onDaySelect)
+        taskListbox.bind("<<ListboxSelect>>", onTaskSelect)
+        setGroupBtn.config(command=setGroup)
+        clearGroupBtn.config(command=clearGroup)
 
         btnFrame = tk.Frame(histWin, bg=self.bgColor)
-        btnFrame.grid(row=1, column=0, columnspan=3, padx=8, pady=(0, 8), sticky="e")
+        btnFrame.grid(row=1, column=0, columnspan=4, padx=8, pady=(0, 8), sticky="e")
 
         closeBtn = tk.Button(
             btnFrame,
@@ -1075,6 +1233,7 @@ class TaskTimerApp:
             ppListbox.selection_set(0)
             current["ppIndex"] = 0
             refreshDays()
+            refreshTaskList()
 
 
 if __name__ == "__main__":
