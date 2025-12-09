@@ -40,6 +40,8 @@ class TaskTimerApp:
         self.unassignedSeconds = 0.0
         self.unassignedStart = None
 
+        self.hasUnsavedTime = False
+
         self.dataFile = os.path.join(self.getBaseDir(), "tasks.json")
 
         self.buildUi()
@@ -272,6 +274,7 @@ class TaskTimerApp:
             now = time.time()
         if self.unassignedStart is None:
             self.unassignedStart = now
+            self.hasUnsavedTime = True
 
     def stopUnassigned(self, now=None):
         if self.unassignedStart is None:
@@ -287,6 +290,7 @@ class TaskTimerApp:
         if self.dragTaskName is not None:
             return
 
+        # clicking the active task toggles it off -> into untasked
         if self.currentTask == name:
             if self.currentStart is not None:
                 elapsed = now - self.currentStart
@@ -294,20 +298,24 @@ class TaskTimerApp:
             self.currentTask = None
             self.currentStart = None
             self.startUnassigned(now)
+            self.hasUnsavedTime = True
             self.refreshRowStyles()
             return
 
+        # finish other active task if any
         if self.currentTask is not None and self.currentStart is not None:
             elapsed = now - self.currentStart
             self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
             self.currentTask = None
             self.currentStart = None
 
+        # leaving untasked mode
         self.stopUnassigned(now)
 
         self.hasEverSelectedTask = True
         self.currentTask = name
         self.currentStart = now
+        self.hasUnsavedTime = True
         self.refreshRowStyles()
 
     def refreshRowStyles(self):
@@ -398,22 +406,132 @@ class TaskTimerApp:
             total += hours
         return agg, total
 
-    def _mergeSummaryForDate(self, dateKey, newSummary):
+    def _mergeSummaryForDate(self, dateKey, newSummary, allowSkip=False):
         existing = self.history.get(dateKey)
         if not existing:
             return newSummary
 
-        resp = messagebox.askyesnocancel(
-            "Existing summary",
-            "A summary already exists for this date.\n\n"
-            "Yes  = append times\n"
-            "No   = overwrite\n"
-            "Cancel = keep existing and abort."
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Existing summary")
+        dialog.configure(bg=self.bgColor)
+        dialog.resizable(False, False)
+
+        dialog.transient(self.root)     # tie it to main window
+        dialog.grab_set()
+        dialog.lift()
+        dialog.focus_force()
+
+        # on Windows, this helps if something else is on top
+        dialog.attributes("-topmost", True)
+        dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+        msg = tk.Label(
+            dialog,
+            text="A summary already exists for this date.\n\nChoose what to do:",
+            font=("Segoe UI", 10),
+            fg=self.textColor,
+            bg=self.bgColor,
+            justify="left"
         )
-        if resp is None:  # Cancel
+        msg.pack(padx=16, pady=(12, 8), anchor="w")
+
+        choice = {"value": None}
+
+        btnFrame = tk.Frame(dialog, bg=self.bgColor)
+        btnFrame.pack(padx=16, pady=(0, 12), anchor="e")
+
+        def setChoice(v):
+            choice["value"] = v
+            dialog.destroy()
+
+        appendBtn = tk.Button(
+            btnFrame,
+            text="Append",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=lambda: setChoice("append")
+        )
+        appendBtn.grid(row=0, column=0, padx=4)
+
+        overwriteBtn = tk.Button(
+            btnFrame,
+            text="Overwrite",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=lambda: setChoice("overwrite")
+        )
+        overwriteBtn.grid(row=0, column=1, padx=4)
+
+        if allowSkip:
+            skipBtn = tk.Button(
+                btnFrame,
+                text="Close without saving",
+                font=("Segoe UI", 9, "bold"),
+                bg="#1b1f24",
+                fg=self.textColor,
+                activebackground="#2c3440",
+                activeforeground=self.textColor,
+                relief="flat",
+                command=lambda: setChoice("skip")
+            )
+            skipBtn.grid(row=0, column=2, padx=4)
+
+            cancelBtn = tk.Button(
+                btnFrame,
+                text="Cancel",
+                font=("Segoe UI", 9),
+                bg="#1b1f24",
+                fg=self.textColor,
+                activebackground="#2c3440",
+                activeforeground=self.textColor,
+                relief="flat",
+                command=lambda: setChoice("cancel")
+            )
+            cancelBtn.grid(row=0, column=3, padx=4)
+        else:
+            cancelBtn = tk.Button(
+                btnFrame,
+                text="Cancel",
+                font=("Segoe UI", 9),
+                bg="#1b1f24",
+                fg=self.textColor,
+                activebackground="#2c3440",
+                activeforeground=self.textColor,
+                relief="flat",
+                command=lambda: setChoice("cancel")
+            )
+            cancelBtn.grid(row=0, column=2, padx=4)
+
+        dialog.bind("<Escape>", lambda e: setChoice("cancel"))
+
+        self.root.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        dw = 420
+        dh = 140
+        x = rx + (rw - dw) // 2
+        y = ry + (rh - dh) // 2
+        dialog.geometry(f"{dw}x{dh}+{x}+{y}")
+
+        dialog.wait_window()
+
+        if choice["value"] in (None, "cancel"):
             return None
-        if resp is False:  # Overwrite
+        if choice["value"] == "skip":
+            return "__SKIP__"
+        if choice["value"] == "overwrite":
             return newSummary
+        # else "append"
 
         newAgg, _ = self._parseSummaryText(newSummary)
         oldAgg, _ = self._parseSummaryText(existing)
@@ -425,9 +543,10 @@ class TaskTimerApp:
         totalHours = sum(combined.values())
         lines = []
         for name, hours in sorted(combined.items(), key=lambda kv: kv[0].lower()):
-            lines.append(f"{name}: {hours:.1f} h")
-        lines.append(f"Total: {totalHours:.1f} h")
+            lines.append(f"{name}: {hours} h")  # keep or re-add rounding if you want
+        lines.append(f"Total: {totalHours} h")
         return "\n".join(lines)
+
 
     def endDay(self):
         now = time.time()
@@ -474,6 +593,8 @@ class TaskTimerApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(merged)
         messagebox.showinfo("Summary (copied to clipboard)", merged)
+
+        self.hasUnsavedTime = False
 
     def createDragGhost(self, name):
         if name not in self.rows:
@@ -576,35 +697,38 @@ class TaskTimerApp:
 
         self.stopUnassigned(now)
 
-        hasTime = any(sec > 0 for sec in self.tasks.values()) or self.unassignedSeconds > 0
-
-        if hasTime:
+        if self.hasUnsavedTime:
             lines = []
             totalHours = 0.0
 
             for name, seconds in self.tasks.items():
                 hours = seconds / 3600.0
-                rounded = round(hours, 1)
-                totalHours += rounded
-                lines.append(f"{name}: {rounded:.1f} h")
+                totalHours += hours
+                lines.append(f"{name}: {hours} h")  # or rounded if you prefer
 
             if self.unassignedSeconds > 0:
                 unHours = self.unassignedSeconds / 3600.0
-                unRounded = round(unHours, 1)
-                totalHours += unRounded
-                lines.append(f"Untasked: {unRounded:.1f} h")
+                totalHours += unHours
+                lines.append(f"Untasked: {unHours} h")
 
-            lines.append(f"Total: {totalHours:.1f} h")
+            lines.append(f"Total: {totalHours} h")
             summary = "\n".join(lines)
 
             todayKey = date.today().isoformat()
-            merged = self._mergeSummaryForDate(todayKey, summary)
+            merged = self._mergeSummaryForDate(todayKey, summary, allowSkip=True)
+
             if merged is None:
-                # user hit Cancel -> don't close, don't lose time
+                return  # cancel close, keep app open
+
+            if merged == "__SKIP__":
+                # close without writing anything new
+                self.hasUnsavedTime = False
+                self.root.destroy()
                 return
 
             self.history[todayKey] = merged
             self.saveData()
+            self.hasUnsavedTime = False
 
         self.root.destroy()
 
@@ -696,7 +820,27 @@ class TaskTimerApp:
         histWin = tk.Toplevel(self.root)
         histWin.title("History")
         histWin.configure(bg=self.bgColor)
-        histWin.geometry("900x500")
+        histWin.withdraw()
+
+        dw, dh = 900, 500
+
+        self.root.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+
+        # center History over main window
+        x = rx + (rw - dw) // 2
+        y = ry + (rh - dh) // 2
+        histWin.geometry(f"{dw}x{dh}+{x}+{y}")
+
+        histWin.deiconify()
+        histWin.transient(self.root)
+        histWin.lift()
+        histWin.focus_force()
+        histWin.attributes("-topmost", True)
+        histWin.after(100, lambda: histWin.attributes("-topmost", False))
 
         histWin.columnconfigure(0, weight=0)
         histWin.columnconfigure(1, weight=0)
