@@ -4,7 +4,7 @@ import time
 import os
 import sys
 import json
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 
 class TaskTimerApp:
     def __init__(self, root):
@@ -44,6 +44,9 @@ class TaskTimerApp:
         self.hasUnsavedTime = False
 
         self.dataFile = os.path.join(self.getBaseDir(), "tasks.json")
+
+        self.dayTimeline = []
+        self.minSegmentSeconds = 6 * 60
 
         self.buildUi()
         self.loadData()
@@ -287,13 +290,36 @@ class TaskTimerApp:
         self.unassignedSeconds += now - self.unassignedStart
         self.unassignedStart = None
 
+    def _recordSegment(self, label, startTs, endTs):
+        if not label or startTs is None or endTs is None:
+            return
+        duration = endTs - startTs
+        if duration <= 0 or duration < self.minSegmentSeconds:
+            return
+        startIso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(startTs))
+        endIso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(endTs))
+        self.dayTimeline.append({
+            "task": label,
+            "start": startIso,
+            "end": endIso
+        })
+
+    def _closeActiveSegment(self, now=None):
+        if now is None:
+            now = time.time()
+        if self.currentTask is not None and self.currentStart is not None:
+            self._recordSegment(self.currentTask, self.currentStart, now)
+        elif self.unassignedStart is not None:
+            self._recordSegment("Untasked", self.unassignedStart, now)
+
     def startTask(self, name):
         now = time.time()
 
         if self.dragTaskName is not None:
             return
 
-        # clicking the active task toggles it off -> into untasked
+        self._closeActiveSegment(now)
+
         if self.currentTask == name:
             if self.currentStart is not None:
                 elapsed = now - self.currentStart
@@ -305,14 +331,12 @@ class TaskTimerApp:
             self.refreshRowStyles()
             return
 
-        # finish other active task if any
         if self.currentTask is not None and self.currentStart is not None:
             elapsed = now - self.currentStart
             self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
             self.currentTask = None
             self.currentStart = None
 
-        # leaving untasked mode
         self.stopUnassigned(now)
 
         self.hasEverSelectedTask = True
@@ -348,6 +372,7 @@ class TaskTimerApp:
         now = time.time()
 
         if self.currentTask == name and self.currentStart is not None:
+            self._closeActiveSegment(now)
             elapsed = now - self.currentStart
             self.tasks[name] = self.tasks.get(name, 0.0) + elapsed
             self.currentTask = None
@@ -419,21 +444,25 @@ class TaskTimerApp:
         return grouped
 
     def _mergeSummaryForDate(self, dateKey, newSummary, allowSkip=False):
-        existing = self.history.get(dateKey)
-        if not existing:
-            return newSummary
+        existingEntry = self.history.get(dateKey)
+        if not existingEntry:
+            return newSummary, "new"
+
+        if isinstance(existingEntry, dict):
+            existingText = existingEntry.get("summary", "") or ""
+        else:
+            existingText = existingEntry or ""
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Existing summary")
         dialog.configure(bg=self.bgColor)
         dialog.resizable(False, False)
 
-        dialog.transient(self.root)     # tie it to main window
+        dialog.transient(self.root)
         dialog.grab_set()
         dialog.lift()
         dialog.focus_force()
 
-        # on Windows, this helps if something else is on top
         dialog.attributes("-topmost", True)
         dialog.after(100, lambda: dialog.attributes("-topmost", False))
 
@@ -538,15 +567,14 @@ class TaskTimerApp:
         dialog.wait_window()
 
         if choice["value"] in (None, "cancel"):
-            return None
+            return None, "cancel"
         if choice["value"] == "skip":
-            return "__SKIP__"
+            return "__SKIP__", "skip"
         if choice["value"] == "overwrite":
-            return newSummary
-        # else "append"
+            return newSummary, "overwrite"
 
         newAgg, _ = self._parseSummaryText(newSummary)
-        oldAgg, _ = self._parseSummaryText(existing)
+        oldAgg, _ = self._parseSummaryText(existingText)
 
         combined = dict(oldAgg)
         for name, hours in newAgg.items():
@@ -555,13 +583,14 @@ class TaskTimerApp:
         totalHours = sum(combined.values())
         lines = []
         for name, hours in sorted(combined.items(), key=lambda kv: kv[0].lower()):
-            lines.append(f"{name}: {hours} h")  # keep or re-add rounding if you want
+            lines.append(f"{name}: {hours} h")
         lines.append(f"Total: {totalHours} h")
-        return "\n".join(lines)
-
+        return "\n".join(lines), "append"
 
     def endDay(self):
         now = time.time()
+
+        self._closeActiveSegment(now)
 
         if self.currentTask is not None and self.currentStart is not None:
             elapsed = now - self.currentStart
@@ -595,12 +624,26 @@ class TaskTimerApp:
         summary = "\n".join(lines)
 
         todayKey = date.today().isoformat()
-        merged = self._mergeSummaryForDate(todayKey, summary)
+        merged, choice = self._mergeSummaryForDate(todayKey, summary)
         if merged is None:
-            return  # user canceled
+            return
 
-        self.history[todayKey] = merged
+        existingEntry = self.history.get(todayKey)
+        existingTimeline = []
+        if isinstance(existingEntry, dict):
+            existingTimeline = existingEntry.get("timeline", []) or []
+
+        if choice == "append" and existingTimeline:
+            timeline = existingTimeline + list(self.dayTimeline)
+        else:
+            timeline = list(self.dayTimeline)
+
+        self.history[todayKey] = {
+            "summary": merged,
+            "timeline": timeline
+        }
         self.saveData()
+        self.dayTimeline = []
 
         self.root.clipboard_clear()
         self.root.clipboard_append(merged)
@@ -700,6 +743,8 @@ class TaskTimerApp:
     def onClose(self):
         now = time.time()
 
+        self._closeActiveSegment(now)
+
         if self.currentTask is not None and self.currentStart is not None:
             elapsed = now - self.currentStart
             self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
@@ -716,7 +761,7 @@ class TaskTimerApp:
             for name, seconds in self.tasks.items():
                 hours = seconds / 3600.0
                 totalHours += hours
-                lines.append(f"{name}: {hours} h")  # or rounded if you prefer
+                lines.append(f"{name}: {hours} h")
 
             if self.unassignedSeconds > 0:
                 unHours = self.unassignedSeconds / 3600.0
@@ -727,20 +772,34 @@ class TaskTimerApp:
             summary = "\n".join(lines)
 
             todayKey = date.today().isoformat()
-            merged = self._mergeSummaryForDate(todayKey, summary, allowSkip=True)
+            merged, choice = self._mergeSummaryForDate(todayKey, summary, allowSkip=True)
 
-            if merged is None:
-                return  # cancel close, keep app open
+            if merged is None or choice == "cancel":
+                return
 
-            if merged == "__SKIP__":
-                # close without writing anything new
+            if merged == "__SKIP__" or choice == "skip":
                 self.hasUnsavedTime = False
+                self.dayTimeline = []
                 self.root.destroy()
                 return
 
-            self.history[todayKey] = merged
+            existingEntry = self.history.get(todayKey)
+            existingTimeline = []
+            if isinstance(existingEntry, dict):
+                existingTimeline = existingEntry.get("timeline", []) or []
+
+            if choice == "append" and existingTimeline:
+                timeline = existingTimeline + list(self.dayTimeline)
+            else:
+                timeline = list(self.dayTimeline)
+
+            self.history[todayKey] = {
+                "summary": merged,
+                "timeline": timeline
+            }
             self.saveData()
             self.hasUnsavedTime = False
+            self.dayTimeline = []
 
         self.root.destroy()
 
@@ -796,7 +855,11 @@ class TaskTimerApp:
         periods.sort(key=lambda p: p["start"], reverse=True)
 
         def parseDaySummary(dayStr):
-            summary = self.history.get(dayStr, "")
+            entry = self.history.get(dayStr, "")
+            if isinstance(entry, dict):
+                summary = entry.get("summary", "") or ""
+            else:
+                summary = entry or ""
             agg = {}
             total = 0.0
             for line in summary.splitlines():
@@ -820,7 +883,11 @@ class TaskTimerApp:
 
         def collectAllTasks():
             names = set()
-            for summary in self.history.values():
+            for entry in self.history.values():
+                if isinstance(entry, dict):
+                    summary = entry.get("summary", "") or ""
+                else:
+                    summary = entry or ""
                 for line in summary.splitlines():
                     if ":" not in line:
                         continue
@@ -855,7 +922,6 @@ class TaskTimerApp:
         rw = self.root.winfo_width()
         rh = self.root.winfo_height()
 
-        # center History over main window
         x = rx + (rw - dw) // 2
         y = ry + (rh - dh) // 2
         histWin.geometry(f"{dw}x{dh}+{x}+{y}")
@@ -936,7 +1002,8 @@ class TaskTimerApp:
         textFrame.rowconfigure(1, weight=1)
         textFrame.rowconfigure(2, weight=0)
         textFrame.rowconfigure(3, weight=1)
-        textFrame.columnconfigure(0, weight=1)
+        textFrame.columnconfigure(0, weight=2)
+        textFrame.columnconfigure(1, weight=1)
 
         daySummaryLabel = tk.Label(
             textFrame,
@@ -946,6 +1013,15 @@ class TaskTimerApp:
             bg=self.bgColor
         )
         daySummaryLabel.grid(row=0, column=0, sticky="w")
+
+        timelineLabel = tk.Label(
+            textFrame,
+            text="Timeline",
+            font=("Segoe UI", 10, "bold"),
+            fg=self.textColor,
+            bg=self.bgColor
+        )
+        timelineLabel.grid(row=0, column=1, sticky="w")
 
         daySummaryBox = tk.Text(
             textFrame,
@@ -958,6 +1034,15 @@ class TaskTimerApp:
         )
         daySummaryBox.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
 
+        timelineCanvas = tk.Canvas(
+            textFrame,
+            bg="#1b1f24",
+            highlightthickness=0
+        )
+        timelineCanvas.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(4, 8))
+        rectTaskMap = {}
+        tooltip = {"win": None, "item": None}
+
         ppSummaryLabel = tk.Label(
             textFrame,
             text="Pay Period Overview",
@@ -965,7 +1050,7 @@ class TaskTimerApp:
             fg=self.textColor,
             bg=self.bgColor
         )
-        ppSummaryLabel.grid(row=2, column=0, sticky="w")
+        ppSummaryLabel.grid(row=2, column=0, columnspan=2, sticky="w")
 
         ppSummaryBox = tk.Text(
             textFrame,
@@ -976,7 +1061,16 @@ class TaskTimerApp:
             highlightthickness=0,
             font=("Segoe UI", 10)
         )
-        ppSummaryBox.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
+        ppSummaryBox.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+        ppPieCanvas = tk.Canvas(
+            textFrame,
+            bg="#1b1f24",
+            highlightthickness=0
+        )
+        ppPieCanvas.grid(row=3, column=1, sticky="nsew", padx=(8, 0), pady=(4, 0))
+        pieSlices = {}
+        pieTooltip = {"win": None, "item": None}
+        ppColorMap = {}
 
         groupingFrame = tk.Frame(histWin, bg=self.bgColor)
         groupingFrame.grid(row=0, column=3, padx=(0, 8), pady=8, sticky="ns")
@@ -1049,7 +1143,6 @@ class TaskTimerApp:
         def formatLines(total, taskAgg):
             lines = [f"Total: {total:.1f} h"]
 
-            # build grouped + ungrouped structures
             grouped = {}
             ungrouped = {}
             for task, hours in taskAgg.items():
@@ -1059,7 +1152,6 @@ class TaskTimerApp:
                 else:
                     ungrouped[task] = hours
 
-            # groups as top-level rows, tasks indented under them
             groupItems = []
             for g, ths in grouped.items():
                 gHours = sum(h for _, h in ths)
@@ -1070,13 +1162,12 @@ class TaskTimerApp:
                 for t, h in sorted(ths, key=lambda kv: kv[1], reverse=True):
                     lines.append(f"  {t}: {h:.1f} h")
 
-            # ungrouped tasks as their own top-level entries
             for t, h in sorted(ungrouped.items(), key=lambda kv: kv[1], reverse=True):
                 lines.append(f"{t}: {h:.1f} h")
 
             return lines
 
-        listItems = []  # (type, value) where type is "group" or "task"
+        listItems = []
         groupedTasks = {}
 
         def refreshTaskList():
@@ -1153,35 +1244,380 @@ class TaskTimerApp:
                 return ""
             return None
 
+        def drawPayPeriodPie(total, taskAgg):
+            nonlocal pieSlices, ppColorMap
+
+            ppPieCanvas.delete("all")
+            pieSlices = {}
+            ppColorMap = {}
+
+            if total <= 0 or not taskAgg:
+                return
+
+            ppPieCanvas.update_idletasks()
+            w = ppPieCanvas.winfo_width() or 160
+            h = ppPieCanvas.winfo_height() or 160
+
+            size = min(w, h) - 20
+            if size <= 0:
+                return
+
+            cx = w / 2
+            cy = h / 2
+            r = size / 2
+
+            items = sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True)
+
+            colorFamilies = [
+                {"base": "#3f8cff", "shades": ["#60a5fa", "#1d4ed8", "#93c5fd"]},  # blue
+                {"base": "#10b981", "shades": ["#34d399", "#047857", "#6ee7b7"]},  # green
+                {"base": "#f97316", "shades": ["#fb923c", "#c2410c", "#fed7aa"]},  # orange
+                {"base": "#e11d48", "shades": ["#fb7185", "#9f1239", "#fecdd3"]},  # red
+                {"base": "#8b5cf6", "shades": ["#a855f7", "#6d28d9", "#ddd6fe"]},  # purple
+                {"base": "#06b6d4", "shades": ["#0ea5e9", "#0891b2", "#bae6fd"]},  # cyan
+                {"base": "#facc15", "shades": ["#eab308", "#ca8a04", "#fef08a"]},  # yellow
+                {"base": "#6366f1", "shades": ["#4f46e5", "#312e81", "#c7d2fe"]},  # indigo
+            ]
+
+            groups = {}
+            ungrouped = []
+            for name, hours in items:
+                if hours <= 0:
+                    continue
+                g = self.groups.get(name)
+                if g:
+                    groups.setdefault(g, []).append(name)
+                else:
+                    ungrouped.append(name)
+
+            groupNames = sorted(groups.keys())
+            taskColor = {}
+
+            # grouped tasks: same family, base + shades
+            for idx, g in enumerate(groupNames):
+                fam = colorFamilies[idx % len(colorFamilies)]
+                shades = [fam["base"]] + fam["shades"]
+                for i, taskName in enumerate(sorted(groups[g])):
+                    c = shades[i % len(shades)]
+                    taskColor[taskName] = c
+                    ppColorMap[taskName] = c
+
+            # ungrouped tasks: only main/base colors
+            offset = len(groupNames)
+            for j, taskName in enumerate(sorted(ungrouped)):
+                fam = colorFamilies[(offset + j) % len(colorFamilies)]
+                c = fam["base"]
+                taskColor[taskName] = c
+                ppColorMap[taskName] = c
+
+            startAngle = 0.0
+            for name, hours in items:
+                if hours <= 0:
+                    continue
+                extent = 360.0 * (hours / total)
+                color = taskColor.get(name, self.accentColor)
+                labelText = f"{name} ({hours:.1f}h, {hours / total * 100:.0f}%)"
+
+                item = ppPieCanvas.create_arc(
+                    cx - r,
+                    cy - r,
+                    cx + r,
+                    cy + r,
+                    start=startAngle,
+                    extent=extent,
+                    fill=color,
+                    outline="#111827"
+                )
+                pieSlices[item] = labelText
+                startAngle += extent
+
+        def showPieTooltip(event):
+            items = ppPieCanvas.find_withtag("current")
+            if not items:
+                hidePieTooltip(event)
+                return
+
+            item = items[0]
+
+            if item == pieTooltip["item"] and pieTooltip["win"] is not None:
+                return
+
+            labelText = pieSlices.get(item)
+            if not labelText:
+                hidePieTooltip(event)
+                return
+
+            if pieTooltip["win"] is not None:
+                pieTooltip["win"].destroy()
+
+            tw = tk.Toplevel(ppPieCanvas)
+            tw.wm_overrideredirect(True)
+            tw.configure(bg="#000000")
+
+            x = event.x_root + 10
+            y = event.y_root + 10
+            tw.wm_geometry(f"+{x}+{y}")
+
+            lbl = tk.Label(
+                tw,
+                text=labelText,
+                bg="#111827",
+                fg="#f9fafb",
+                font=("Segoe UI", 8)
+            )
+            lbl.pack(ipadx=4, ipady=2)
+
+            pieTooltip["win"] = tw
+            pieTooltip["item"] = item
+
+        def hidePieTooltip(event):
+            if pieTooltip["win"] is not None:
+                pieTooltip["win"].destroy()
+                pieTooltip["win"] = None
+            pieTooltip["item"] = None
+
         def showPayPeriodSummary():
             ppIdx = current["ppIndex"]
             if ppIdx < 0 or ppIdx >= len(periods):
                 ppSummaryBox.delete("1.0", tk.END)
+                ppPieCanvas.delete("all")
                 return
             p = periods[ppIdx]
             agg = p.get("agg", {})
             total = p.get("total", 0.0)
+
+            drawPayPeriodPie(total, agg)
 
             lines = formatLines(total, agg)
 
             ppSummaryBox.delete("1.0", tk.END)
             ppSummaryBox.insert(tk.END, "\n".join(lines))
 
+            for name, color in ppColorMap.items():
+                tagName = f"pp_{name}"
+                try:
+                    ppSummaryBox.tag_configure(tagName, foreground=color)
+                except tk.TclError:
+                    continue
+
+                start = "1.0"
+                pattern = f"{name}:"
+                while True:
+                    pos = ppSummaryBox.search(pattern, start, tk.END)
+                    if not pos:
+                        break
+                    end = f"{pos}+{len(name)}c"
+                    ppSummaryBox.tag_add(tagName, pos, end)
+                    start = f"{end}+1c"
+
+        def drawTimelineForDayKey(dayKey):
+            nonlocal rectTaskMap
+
+            rectTaskMap = {}
+            timelineCanvas.delete("all")
+
+            entry = self.history.get(dayKey)
+            if isinstance(entry, dict):
+                segments = entry.get("timeline") or []
+            else:
+                segments = []
+
+            if not segments:
+                return
+
+            timelineCanvas.update_idletasks()
+            width = timelineCanvas.winfo_width() or 260
+            height = timelineCanvas.winfo_height() or 140
+
+            marginLeft = 70
+            marginRight = 10
+            marginTop = 10
+            marginBottom = 22
+
+            areaTop = marginTop
+            areaBottom = height - marginBottom
+            if areaBottom <= areaTop:
+                areaBottom = areaTop + 10
+
+            tasks = sorted({(seg.get("task") or "Untasked") for seg in segments})
+            nTasks = max(1, len(tasks))
+
+            rowGap = 4
+            totalHeight = areaBottom - areaTop
+            rowHeight = max(6, (totalHeight - rowGap * (nTasks - 1)) / nTasks)
+
+            taskToRow = {t: i for i, t in enumerate(tasks)}
+
+            spanSec = 24 * 3600.0
+            innerWidth = max(1, width - marginLeft - marginRight)
+
+            palette = [
+                self.accentColor,
+                "#10b981",  # green
+                "#f97316",  # orange
+                "#e11d48",  # red/pink
+                "#8b5cf6",  # purple
+                "#06b6d4",  # cyan
+                "#facc15",  # yellow
+                "#6366f1",  # indigo
+            ]
+            colorMap = {}
+            pi = 0
+            for task in tasks:
+                if task == "Untasked":
+                    colorMap[task] = "#444c56"
+                else:
+                    colorMap[task] = palette[pi % len(palette)]
+                    pi += 1
+
+            for seg in segments:
+                task = seg.get("task") or "Untasked"
+                startStr = seg.get("start")
+                endStr = seg.get("end")
+                if not startStr or not endStr:
+                    continue
+                try:
+                    startDt = datetime.fromisoformat(startStr)
+                    endDt = datetime.fromisoformat(endStr)
+                except Exception:
+                    continue
+
+                startSec = startDt.hour * 3600 + startDt.minute * 60 + startDt.second
+                endSec = endDt.hour * 3600 + endDt.minute * 60 + endDt.second
+                if endSec <= startSec:
+                    continue
+
+                rowIndex = taskToRow.get(task, 0)
+                y1 = areaTop + rowIndex * (rowHeight + rowGap)
+                y2 = y1 + rowHeight
+
+                x1 = marginLeft + (startSec / spanSec) * innerWidth
+                x2 = marginLeft + (endSec / spanSec) * innerWidth
+
+                color = colorMap.get(task, self.accentColor)
+
+                item = timelineCanvas.create_rectangle(
+                    x1, y1, x2, y2,
+                    fill=color,
+                    outline=""
+                )
+                labelText = f"{task} {startDt.strftime('%H:%M')}–{endDt.strftime('%H:%M')}"
+                rectTaskMap[item] = labelText
+
+            for task, rowIndex in taskToRow.items():
+                cy = areaTop + rowIndex * (rowHeight + rowGap) + rowHeight / 2
+                timelineCanvas.create_text(
+                    marginLeft - 6,
+                    cy,
+                    text=task,
+                    anchor="e",
+                    fill="#9ca3af",
+                    font=("Segoe UI", 7)
+                )
+
+            axisY = areaBottom + 4
+            tickY1 = axisY
+            tickY2 = axisY + 4
+            labelY = axisY + 10
+            for hour in (0, 6, 12, 18, 24):
+                x = marginLeft + (hour * 3600.0 / spanSec) * innerWidth
+                timelineCanvas.create_line(x, tickY1, x, tickY2, fill="#6b7280")
+                timelineCanvas.create_text(
+                    x,
+                    labelY,
+                    text=f"{hour:02d}",
+                    fill="#9ca3af",
+                    font=("Segoe UI", 7)
+                )
+
+            legendY = marginTop
+            legendX = marginLeft + innerWidth * 0.65
+            for task in tasks:
+                color = colorMap[task]
+                timelineCanvas.create_rectangle(
+                    legendX,
+                    legendY,
+                    legendX + 10,
+                    legendY + 10,
+                    fill=color,
+                    outline=""
+                )
+                timelineCanvas.create_text(
+                    legendX + 14,
+                    legendY + 5,
+                    text=task,
+                    anchor="w",
+                    fill="#9ca3af",
+                    font=("Segoe UI", 7)
+                )
+                legendY += 14
+
+        def showTooltip(event):
+            items = timelineCanvas.find_withtag("current")
+            if not items:
+                hideTooltip(event)
+                return
+
+            item = items[0]
+
+            if item == tooltip["item"] and tooltip["win"] is not None:
+                return
+
+            labelText = rectTaskMap.get(item)
+            if not labelText:
+                hideTooltip(event)
+                return
+
+            if tooltip["win"] is not None:
+                tooltip["win"].destroy()
+
+            tw = tk.Toplevel(timelineCanvas)
+            tw.wm_overrideredirect(True)
+            tw.configure(bg="#000000")
+
+            x = event.x_root + 10
+            y = event.y_root + 10
+            tw.wm_geometry(f"+{x}+{y}")
+
+            lbl = tk.Label(
+                tw,
+                text=labelText,
+                bg="#111827",
+                fg="#f9fafb",
+                font=("Segoe UI", 8)
+            )
+            lbl.pack(ipadx=4, ipady=2)
+
+            tooltip["win"] = tw
+            tooltip["item"] = item
+
+        def hideTooltip(event):
+            if tooltip["win"] is not None:
+                tooltip["win"].destroy()
+                tooltip["win"] = None
+            tooltip["item"] = None
+
+
         def showDaySummary(dayIdx):
             ppIdx = current["ppIndex"]
             if ppIdx < 0 or ppIdx >= len(periods):
                 daySummaryBox.delete("1.0", tk.END)
+                timelineCanvas.delete("all")
                 return
 
             period = periods[ppIdx]
             if dayIdx < 0 or dayIdx >= len(period["days"]):
                 daySummaryBox.delete("1.0", tk.END)
+                timelineCanvas.delete("all")
                 return
 
             dStr = period["days"][dayIdx]
-            raw = self.history.get(dStr, "") or ""
+            entry = self.history.get(dStr, "") or ""
+            if isinstance(entry, dict):
+                raw = entry.get("summary", "") or ""
+            else:
+                raw = entry
 
-            # Parse just like pay periods
             taskAgg = {}
             total = 0.0
             for line in raw.splitlines():
@@ -1192,7 +1628,7 @@ class TaskTimerApp:
                 rest = rest.strip()
                 if not rest:
                     continue
-                token = rest.split()[0]  # first number
+                token = rest.split()[0]
                 try:
                     hours = float(token)
                 except ValueError:
@@ -1206,7 +1642,7 @@ class TaskTimerApp:
 
             daySummaryBox.delete("1.0", tk.END)
             daySummaryBox.insert(tk.END, "\n".join(lines))
-
+            drawTimelineForDayKey(dStr)
 
         def getSelectedDayIdx():
             sel = dayListbox.curselection()
@@ -1218,6 +1654,8 @@ class TaskTimerApp:
             dayListbox.delete(0, tk.END)
             ppIdx = current["ppIndex"]
             if ppIdx < 0 or ppIdx >= len(periods):
+                daySummaryBox.delete("1.0", tk.END)
+                timelineCanvas.delete("all")
                 return
             period = periods[ppIdx]
             for dStr in period["days"]:
@@ -1234,6 +1672,7 @@ class TaskTimerApp:
                 showDaySummary(0)
             else:
                 daySummaryBox.delete("1.0", tk.END)
+                timelineCanvas.delete("all")
 
         def onPayPeriodSelect(event):
             sel = ppListbox.curselection()
@@ -1285,6 +1724,10 @@ class TaskTimerApp:
                     showDaySummary(dayIdx)
 
         ppListbox.bind("<<ListboxSelect>>", onPayPeriodSelect)
+        ppPieCanvas.bind("<Motion>", showPieTooltip)
+        ppPieCanvas.bind("<Leave>", hidePieTooltip)
+        timelineCanvas.bind("<Motion>", showTooltip)
+        timelineCanvas.bind("<Leave>", hideTooltip)
         dayListbox.bind("<<ListboxSelect>>", onDaySelect)
         taskListbox.bind("<<ListboxSelect>>", onTaskSelect)
         setGroupBtn.config(command=setGroup)
