@@ -10,6 +10,7 @@ class TaskTimerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Task Timer")
+        self.root.iconbitmap("hourglass.ico")
 
         self.bgColor = "#111315"
         self.cardColor = "#1e2227"
