@@ -6,11 +6,16 @@ import sys
 import json
 from datetime import date, timedelta, datetime
 
+def resourcePath(relPath):
+	if hasattr(sys, "_MEIPASS"):
+		return os.path.join(sys._MEIPASS, relPath)
+	return relPath
+
 class TaskTimerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Task Timer")
-        self.root.iconbitmap("hourglass.ico")
+        self.root.iconbitmap(resourcePath("hourglass.ico"))
 
         self.bgColor = "#111315"
         self.cardColor = "#1e2227"
