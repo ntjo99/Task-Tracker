@@ -651,9 +651,10 @@ class TaskTimerApp:
         self.saveData()
         self.dayTimeline = []
 
-        self.root.clipboard_clear()
-        self.root.clipboard_append(merged)
-        messagebox.showinfo("Summary (copied to clipboard)", merged)
+        # TODO: settings for if you want this copied to your clipboard
+        #self.root.clipboard_clear()
+        #self.root.clipboard_append(merged)
+        #messagebox.showinfo("Summary (copied to clipboard)", merged)
 
         self.hasUnsavedTime = False
 
@@ -859,6 +860,28 @@ class TaskTimerApp:
                 "days": daysSorted
             })
         periods.sort(key=lambda p: p["start"], reverse=True)
+
+        def _parseTimeToSeconds(ts): # Need this so that I don't get timezone confusion
+            try:
+                tpart = ts.split("T", 1)[1]
+            except IndexError:
+                return None, None, None, None
+
+            for sep in ("+", "-", "Z"):
+                idx = tpart.find(sep)
+                if idx > 0:
+                    tpart = tpart[:idx]
+                    break
+
+            comps = tpart.split(":")
+            if len(comps) < 2:
+                return None, None, None, None
+
+            h = int(comps[0])
+            m = int(comps[1])
+            s = int(comps[2]) if len(comps) > 2 else 0
+            total = h * 3600 + m * 60 + s
+            return h, m, s, total
 
         def parseDaySummary(dayStr):
             entry = self.history.get(dayStr, "")
@@ -1273,7 +1296,7 @@ class TaskTimerApp:
             r = size / 2
 
             items = sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True)
-
+            #TODO: settings for color preferences
             colorFamilies = [
                 {"base": "#3f8cff", "shades": ["#60a5fa", "#1d4ed8", "#93c5fd"]},  # blue
                 {"base": "#10b981", "shades": ["#34d399", "#047857", "#6ee7b7"]},  # green
@@ -1423,82 +1446,116 @@ class TaskTimerApp:
             timelineCanvas.delete("all")
 
             entry = self.history.get(dayKey)
-            if isinstance(entry, dict):
-                segments = entry.get("timeline") or []
-            else:
-                segments = []
+            segments = entry.get("timeline") if isinstance(entry, dict) else []
 
             if not segments:
                 return
 
-            timelineCanvas.update_idletasks()
-            width = timelineCanvas.winfo_width() or 260
-            height = timelineCanvas.winfo_height() or 140
-
-            marginLeft = 70
-            marginRight = 10
-            marginTop = 10
-            marginBottom = 22
-
-            areaTop = marginTop
-            areaBottom = height - marginBottom
-            if areaBottom <= areaTop:
-                areaBottom = areaTop + 10
-
-            tasks = sorted({(seg.get("task") or "Untasked") for seg in segments})
-            nTasks = max(1, len(tasks))
-
-            rowGap = 4
-            totalHeight = areaBottom - areaTop
-            rowHeight = max(6, (totalHeight - rowGap * (nTasks - 1)) / nTasks)
-
-            taskToRow = {t: i for i, t in enumerate(tasks)}
-
-            spanSec = 24 * 3600.0
-            innerWidth = max(1, width - marginLeft - marginRight)
-
-            palette = [
-                self.accentColor,
-                "#10b981",  # green
-                "#f97316",  # orange
-                "#e11d48",  # red/pink
-                "#8b5cf6",  # purple
-                "#06b6d4",  # cyan
-                "#facc15",  # yellow
-                "#6366f1",  # indigo
-            ]
-            colorMap = {}
-            pi = 0
-            for task in tasks:
-                if task == "Untasked":
-                    colorMap[task] = "#444c56"
-                else:
-                    colorMap[task] = palette[pi % len(palette)]
-                    pi += 1
+            # --- Calculate Dynamic Time Range ---
+            min_sec, max_sec = 24 * 3600, 0
+            valid_segments = []
+            
+            from datetime import datetime
+            
+            for seg in segments:
+                            min_sec = 24 * 3600
+            max_sec = 0
+            valid_segments = []
 
             for seg in segments:
-                task = seg.get("task") or "Untasked"
                 startStr = seg.get("start")
                 endStr = seg.get("end")
                 if not startStr or not endStr:
                     continue
-                try:
-                    startDt = datetime.fromisoformat(startStr)
-                    endDt = datetime.fromisoformat(endStr)
-                except Exception:
+
+                hStart, mStart, sStart, startSec = _parseTimeToSeconds(startStr)
+                hEnd, mEnd, sEnd, endSec = _parseTimeToSeconds(endStr)
+                if startSec is None or endSec is None:
                     continue
 
-                startSec = startDt.hour * 3600 + startDt.minute * 60 + startDt.second
-                endSec = endDt.hour * 3600 + endDt.minute * 60 + endDt.second
-                if endSec <= startSec:
-                    continue
+                if endSec > startSec:
+                    min_sec = min(min_sec, startSec)
+                    max_sec = max(max_sec, endSec)
+                    valid_segments.append({
+                        **seg,
+                        "task": seg.get("task") or "Untasked",
+                        "startSec": startSec,
+                        "endSec": endSec,
+                        "hStart": hStart,
+                        "mStart": mStart,
+                        "hEnd": hEnd,
+                        "mEnd": mEnd,
+                    })
 
+            if not valid_segments:
+                return
+
+            spanStartSec = max(0, (min_sec // 3600) * 3600)
+            spanEndSec = min(24 * 3600, ((max_sec + 3599) // 3600) * 3600)
+            spanSec = max(60.0, spanEndSec - spanStartSec)
+
+            # --- Canvas Setup and Margins ---
+            timelineCanvas.update_idletasks()
+            width = timelineCanvas.winfo_width() or 260
+            height = timelineCanvas.winfo_height() or 140
+
+            # Margin adjusted for X-axis cutoff (Change C)
+            marginLeft = 10
+            marginRight = 10
+            marginTop = 10
+            # Increased marginBottom to prevent X-axis labels from being cut off (Change C)
+            marginBottom = 30
+
+            areaTop = marginTop
+            areaBottom = height - marginBottom
+            areaBottom = areaTop + 10 if areaBottom <= areaTop else areaBottom
+
+            # --- Task Mapping and Row Calculation (Change B) ---
+            # The list of tasks defines the row order AND the key order.
+            tasks = sorted({seg["task"] for seg in valid_segments}) # Task order is now fixed
+
+            # --- Key/Plot Space Allocation (Change A) ---
+            keyWidthRatio = 0.25 # Allocate 25% of the width for the key
+            keyWidth = width * keyWidthRatio
+            
+            # Inner plotting area is the width minus the key area and margins
+            innerWidth = max(1, width - marginLeft - marginRight - keyWidth)
+            plotAreaRight = marginLeft + innerWidth # The X-coordinate where the plot area ends and the key begins
+
+            nTasks = max(1, len(tasks))
+            rowGap = 4
+            totalHeight = areaBottom - areaTop
+            rowHeight = max(6, (totalHeight - rowGap * (nTasks - 1)) / nTasks)
+
+            # taskToRow is built from the sorted tasks list
+            taskToRow = {t: i for i, t in enumerate(tasks)}
+
+            # Color Palette setup
+            palette = [
+                self.accentColor, "#10b981", "#f97316", "#e11d48",
+                "#8b5cf6", "#06b6d4", "#facc15", "#6366f1",
+            ]
+            colorMap = {}
+            pi = 0
+            for task in tasks:
+                colorMap[task] = "#444c56" if task == "Untasked" else palette[pi % len(palette)]
+                if task != "Untasked":
+                    pi += 1
+
+            # --- Draw Segments (Horizontal Bars) ---
+            for seg in valid_segments:
+                task = seg["task"]
+                startSec = seg["startSec"]
+                endSec = seg["endSec"]
+                
+                # Y calculation remains the same
                 rowIndex = taskToRow.get(task, 0)
                 y1 = areaTop + rowIndex * (rowHeight + rowGap)
                 y2 = y1 + rowHeight
 
-                x1 = marginLeft + (startSec / spanSec) * innerWidth
-                x2 = marginLeft + (endSec / spanSec) * innerWidth
+                # X calculation now uses the limited innerWidth
+                x1 = marginLeft + ((startSec - spanStartSec) / spanSec) * innerWidth
+                x2 = marginLeft + ((endSec - spanStartSec) / spanSec) * innerWidth
 
                 color = colorMap.get(task, self.accentColor)
 
@@ -1507,56 +1564,80 @@ class TaskTimerApp:
                     fill=color,
                     outline=""
                 )
-                labelText = f"{task} {startDt.strftime('%H:%M')}–{endDt.strftime('%H:%M')}"
+                labelText = f"{task} {seg['hStart']:02d}:{seg['mStart']:02d}–{seg['hEnd']:02d}:{seg['mEnd']:02d}"
                 rectTaskMap[item] = labelText
 
-            for task, rowIndex in taskToRow.items():
-                cy = areaTop + rowIndex * (rowHeight + rowGap) + rowHeight / 2
-                timelineCanvas.create_text(
-                    marginLeft - 6,
-                    cy,
-                    text=task,
-                    anchor="e",
-                    fill="#9ca3af",
-                    font=("Segoe UI", 7)
-                )
 
+            # --- Draw Time Axis (X-Axis) ---
+            # X-Axis is drawn across the plot area only
             axisY = areaBottom + 4
             tickY1 = axisY
             tickY2 = axisY + 4
-            labelY = axisY + 10
-            for hour in (0, 6, 12, 18, 24):
-                x = marginLeft + (hour * 3600.0 / spanSec) * innerWidth
+            labelY = axisY + 10 # This position is safer due to increased marginBottom (Change C)
+            
+            span_hours = spanSec / 3600.0
+            
+            if span_hours < 3:
+                step_sec = 1800
+            elif span_hours < 8:
+                step_sec = 3600
+            else:
+                step_sec = 10800 
+
+            first_tick_sec = (spanStartSec // step_sec + 1) * step_sec
+            ticks_sec = sorted(list(set([spanStartSec, spanEndSec] + list(range(first_tick_sec, spanEndSec, step_sec)))))
+            
+            # Draw line up to the new plotAreaRight boundary
+            timelineCanvas.create_line(marginLeft, axisY, plotAreaRight, axisY, fill="#6b7280")
+
+            for sec in ticks_sec:
+                if sec < spanStartSec or sec > spanEndSec:
+                    continue
+
+                x = marginLeft + ((sec - spanStartSec) / spanSec) * innerWidth
+                
+                # Ensure label is not drawn past the plot boundary
+                if x > plotAreaRight:
+                     continue 
+                     
+                hour = int(sec // 3600) % 24
+                time_label = f"{hour:02d}"
+
                 timelineCanvas.create_line(x, tickY1, x, tickY2, fill="#6b7280")
                 timelineCanvas.create_text(
-                    x,
-                    labelY,
-                    text=f"{hour:02d}",
-                    fill="#9ca3af",
+                    x, labelY, text=time_label,
+                    fill="#9ca3af", anchor="n",
                     font=("Segoe UI", 7)
                 )
 
+            # --- Draw Legend (Key) ---
             legendY = marginTop
-            legendX = marginLeft + innerWidth * 0.65
-            for task in tasks:
+            legendX = plotAreaRight + 10 # Start the legend immediately after the plot area, plus a small gap
+
+            # Task order is tasks, which is sorted, matching the row order (Change B)
+            for task in tasks: 
                 color = colorMap[task]
+                
+                rect_size = 10
+                rect_gap = 4
+                row_step = 14
+
+                # Draw color box
                 timelineCanvas.create_rectangle(
-                    legendX,
-                    legendY,
-                    legendX + 10,
-                    legendY + 10,
+                    legendX, legendY, legendX + rect_size, legendY + rect_size,
                     fill=color,
                     outline=""
                 )
+                # Draw task label
                 timelineCanvas.create_text(
-                    legendX + 14,
-                    legendY + 5,
+                    legendX + rect_size + rect_gap,
+                    legendY + rect_size/2,
                     text=task,
                     anchor="w",
                     fill="#9ca3af",
                     font=("Segoe UI", 7)
                 )
-                legendY += 14
+                legendY += row_step
 
         def showTooltip(event):
             items = timelineCanvas.find_withtag("current")
