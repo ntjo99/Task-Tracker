@@ -654,7 +654,7 @@ class TaskTimerApp:
         # TODO: settings for if you want this copied to your clipboard
         #self.root.clipboard_clear()
         #self.root.clipboard_append(merged)
-        #messagebox.showinfo("Summary (copied to clipboard)", merged)
+        messagebox.showinfo("Summary: ", merged)
 
         self.hasUnsavedTime = False
 
@@ -943,7 +943,7 @@ class TaskTimerApp:
         histWin.configure(bg=self.bgColor)
         histWin.withdraw()
 
-        dw, dh = 900, 500
+        dw, dh = 1050, 620
 
         self.root.update_idletasks()
         rx = self.root.winfo_rootx()
