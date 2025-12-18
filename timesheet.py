@@ -4,6 +4,7 @@ import time
 import os
 import sys
 import json
+import tempfile
 from datetime import date, timedelta, datetime
 
 def resourcePath(relPath):
@@ -49,8 +50,23 @@ class TaskTimerApp:
 
         self.hasUnsavedTime = False
 
-        self.dataFile = os.path.join(self.getBaseDir(), "tasks.json")
+        baseDir = self.getBaseDir()
+        # always write to tasks.jsonl. For reading: prefer tasks.jsonl, otherwise fall back to tasks.example.jsonl.
+        self.realPath = os.path.join(baseDir, "tasks.jsonl")
+        self.examplePath = os.path.join(baseDir, "tasks.example.jsonl")
 
+        if os.path.exists(self.realPath):
+            # use the real file when present (never touch the example)
+            self.dataFile = self.realPath
+            self.using_example = False
+        elif os.path.exists(self.examplePath):
+            # no real file yet — read from example until the user makes a change
+            self.dataFile = self.examplePath
+            self.using_example = True
+        else:
+            # neither exists — default to real path (will be created on first save)
+            self.dataFile = self.realPath
+            self.using_example = False
         self.dayTimeline = []
         self.minSegmentSeconds = 6 * 60
 
@@ -155,27 +171,202 @@ class TaskTimerApp:
         if not os.path.exists(self.dataFile):
             return
         try:
+            tasks_list = []
+            groups = {}
+            history = {}
             with open(self.dataFile, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for name in data.get("tasks", []):
+                is_jsonl = True
+                for raw in f:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        # not JSONL -> fallback to full JSON
+                        is_jsonl = False
+                        break
+                    t = obj.get("type")
+                    if t == "task":
+                        name = obj.get("name")
+                        if name:
+                            tasks_list.append(name)
+                    elif t == "group":
+                        task = obj.get("task")
+                        grp = obj.get("group")
+                        if task:
+                            groups[task] = grp
+                    elif t == "history":
+                        d = obj.get("date")
+                        if not d:
+                            continue
+                        entry = {}
+                        entry["summary"] = obj.get("summary", "") or ""
+                        entry["timeline"] = obj.get("timeline", []) or []
+                        history[d] = entry
+                if not is_jsonl:
+                    # fallback: parse entire file as legacy JSON
+                    f.seek(0)
+                    data = json.load(f)
+                    tasks_list = data.get("tasks", [])
+                    history = data.get("history", {}) or {}
+                    groups = data.get("groups", {}) or {}
+            for name in tasks_list:
                 self.createTaskRow(name)
-            self.history = data.get("history", {})
-            self.groups = data.get("groups", {}) or {}
+            self.history = history
+            self.groups = groups
         except Exception:
             self.history = {}
 
     def saveData(self):
-        names = list(self.rows.keys())
-        data = {
-            "tasks": names,
-            "history": self.history,
-            "groups": self.groups
-        }
+        # Replace task/group section in file with current desired state (removes deleted tasks/groups).
+        self.sync_task_group_section()
+        return
+
+    def sync_task_group_section(self):
+        """Rewrite the file so the beginning contains current task records (in order),
+           then current group records, then preserve all existing history records.
+        """
+        desired_tasks = list(self.rows.keys())
+        desired_groups = dict(self.groups or {})
+
+        dirpath = os.path.dirname(self.realPath) or "."
         try:
-            with open(self.dataFile, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.makedirs(dirpath, exist_ok=True)
         except Exception:
             pass
+
+        # If file doesn't exist create it with tasks -> groups (no history yet).
+        if not os.path.exists(self.realPath):
+            try:
+                with open(self.realPath, "w", encoding="utf-8") as f:
+                    for name in desired_tasks:
+                        f.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False) + "\n")
+                    for t, g in desired_groups.items():
+                        f.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False) + "\n")
+                self.dataFile = self.realPath
+            except Exception:
+                pass
+            return
+
+        tmp = None
+        try:
+            # collect history lines (and any non-task/group lines) to preserve
+            preserved_lines = []
+            with open(self.realPath, "r", encoding="utf-8") as rf:
+                for raw in rf:
+                    line = raw.rstrip("\n")
+                    if not line.strip():
+                        preserved_lines.append("")  # keep blank lines
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        preserved_lines.append(line)
+                        continue
+                    t = obj.get("type")
+                    if t == "history":
+                        preserved_lines.append(line)
+                    else:
+                        # skip task/group lines
+                        continue
+
+            tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, dir=dirpath)
+            # write fresh task lines
+            for name in desired_tasks:
+                tmp.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False) + "\n")
+            # write fresh group lines
+            for t, g in desired_groups.items():
+                tmp.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False) + "\n")
+            # append preserved history / other lines
+            for l in preserved_lines:
+                if l == "":
+                    tmp.write("\n")
+                else:
+                    tmp.write(l + "\n")
+
+            tmp.flush()
+            tmp.close()
+            os.replace(tmp.name, self.realPath)
+            self.dataFile = self.realPath
+        except Exception:
+            try:
+                if tmp is not None:
+                    tmp.close()
+                    if os.path.exists(tmp.name):
+                        os.remove(tmp.name)
+            except Exception:
+                pass
+            return
+
+    def append_history_entry(self, dateKey, entry):
+        """Write the given history record, replacing any existing record for the same date.
+           Streaming rewrite: copy file to a temp file skipping any existing history for dateKey,
+           then append the new history record. If file missing create it with current tasks/groups then the history.
+        """
+        dirpath = os.path.dirname(self.realPath) or "."
+        try:
+            os.makedirs(dirpath, exist_ok=True)
+        except Exception:
+            pass
+
+        if isinstance(entry, dict):
+            summary = entry.get("summary", "") or ""
+            timeline = entry.get("timeline", []) or []
+        else:
+            summary = entry or ""
+            timeline = []
+
+        new_obj = {"type": "history", "date": dateKey, "summary": summary, "timeline": timeline}
+
+        # If file doesn't exist, create and write tasks/groups then history.
+        if not os.path.exists(self.realPath):
+            try:
+                with open(self.realPath, "w", encoding="utf-8") as f:
+                    for name in list(self.rows.keys()):
+                        f.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False) + "\n")
+                    for t, g in (self.groups or {}).items():
+                        f.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False) + "\n")
+                    f.write(json.dumps(new_obj, ensure_ascii=False) + "\n")
+                self.dataFile = self.realPath
+            except Exception:
+                pass
+            return
+
+        tmp = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, dir=dirpath)
+            with open(self.realPath, "r", encoding="utf-8") as rf:
+                for raw in rf:
+                    line = raw.rstrip("\n")
+                    if not line.strip():
+                        tmp.write(raw)
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        tmp.write(line + "\n")
+                        continue
+                    if obj.get("type") == "history" and obj.get("date") == dateKey:
+                        # skip existing history for this date (we will append the new one)
+                        continue
+                    tmp.write(line + "\n")
+
+            # Append the new history record at the end.
+            tmp.write(json.dumps(new_obj, ensure_ascii=False) + "\n")
+            tmp.flush()
+            tmp.close()
+            os.replace(tmp.name, self.realPath)
+            self.dataFile = self.realPath
+        except Exception:
+            try:
+                if tmp is not None:
+                    tmp.close()
+                    if os.path.exists(tmp.name):
+                        os.remove(tmp.name)
+            except Exception:
+                pass
+            return
 
     def adjustWindowHeight(self):
         self.root.update_idletasks()
@@ -648,7 +839,8 @@ class TaskTimerApp:
             "summary": merged,
             "timeline": timeline
         }
-        self.saveData()
+        # append only the day's summary to the jsonl log
+        self.append_history_entry(todayKey, self.history[todayKey])
         self.dayTimeline = []
 
         # TODO: settings for if you want this copied to your clipboard
@@ -804,7 +996,8 @@ class TaskTimerApp:
                 "summary": merged,
                 "timeline": timeline
             }
-            self.saveData()
+            # append only the day's summary to the jsonl log
+            self.append_history_entry(todayKey, self.history[todayKey])
             self.hasUnsavedTime = False
             self.dayTimeline = []
 
@@ -938,37 +1131,44 @@ class TaskTimerApp:
             p["agg"] = agg
             p["total"] = total
 
-        histWin = tk.Toplevel(self.root)
-        histWin.iconbitmap(resourcePath("hourglass.ico"))
-        histWin.title("History")
-        histWin.configure(bg=self.bgColor)
-        histWin.withdraw()
+        if getattr(self, "histWin", None) is not None and self.histWin.winfo_exists():
+            histWin = self.histWin
+            histWin.deiconify()
+            histWin.lift()
+            histWin.focus_force()
+        else:
+            histWin = tk.Toplevel(self.root)
+            self.histWin = histWin
+            histWin.withdraw()
 
-        dw, dh = 1050, 620
+            histWin.iconbitmap(resourcePath("hourglass.ico"))
+            histWin.title("History")
+            histWin.configure(bg=self.bgColor)
 
-        self.root.update_idletasks()
-        rx = self.root.winfo_rootx()
-        ry = self.root.winfo_rooty()
-        rw = self.root.winfo_width()
-        rh = self.root.winfo_height()
+            dw, dh = 1050, 620
 
-        x = rx + (rw - dw) // 2
-        y = ry + (rh - dh) // 2
-        histWin.geometry(f"{dw}x{dh}+{x}+{y}")
+            histWin.update_idletasks()
+            sw = histWin.winfo_screenwidth()
+            sh = histWin.winfo_screenheight()
+
+            x = (sw - dw) // 2
+            y = (sh - dh) // 2
+            histWin.geometry(f"{dw}x{dh}+{x}+{y}")
+
+            histWin.columnconfigure(0, weight=0)
+            histWin.columnconfigure(1, weight=0)
+            histWin.columnconfigure(2, weight=1)
+            histWin.columnconfigure(3, weight=0)
+            histWin.rowconfigure(0, weight=1)
+            histWin.rowconfigure(1, weight=0)
+
+            histWin.transient(self.root)
 
         histWin.deiconify()
-        histWin.transient(self.root)
         histWin.lift()
         histWin.focus_force()
         histWin.attributes("-topmost", True)
         histWin.after(100, lambda: histWin.attributes("-topmost", False))
-
-        histWin.columnconfigure(0, weight=0)
-        histWin.columnconfigure(1, weight=0)
-        histWin.columnconfigure(2, weight=1)
-        histWin.columnconfigure(3, weight=0)
-        histWin.rowconfigure(0, weight=1)
-        histWin.rowconfigure(1, weight=0)
 
         ppFrame = tk.Frame(histWin, bg=self.bgColor)
         ppFrame.grid(row=0, column=0, padx=8, pady=8, sticky="ns")
@@ -1253,7 +1453,7 @@ class TaskTimerApp:
                 return None
 
             groupsFound = set()
-            hasUngrouped = False
+            hasUngrouped = False;
 
             for idx in sel:
                 if idx >= len(listItems):
