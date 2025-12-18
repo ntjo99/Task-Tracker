@@ -1530,17 +1530,13 @@ class TaskTimerApp:
             # taskToRow is built from the sorted tasks list
             taskToRow = {t: i for i, t in enumerate(tasks)}
 
-            # Color Palette setup
-            palette = [
-                self.accentColor, "#10b981", "#f97316", "#e11d48",
-                "#8b5cf6", "#06b6d4", "#facc15", "#6366f1",
-            ]
+            # Color map: match the pay period pie colors (including group shading)
             colorMap = {}
-            pi = 0
             for task in tasks:
-                colorMap[task] = "#444c56" if task == "Untasked" else palette[pi % len(palette)]
-                if task != "Untasked":
-                    pi += 1
+                if task == "Untasked":
+                    colorMap[task] = "#444c56"
+                else:
+                    colorMap[task] = ppColorMap.get(task, self.accentColor)
 
             # --- Draw Segments (Horizontal Bars) ---
             for seg in valid_segments:
@@ -1729,6 +1725,22 @@ class TaskTimerApp:
 
             daySummaryBox.delete("1.0", tk.END)
             daySummaryBox.insert(tk.END, "\n".join(lines))
+            for name, color in ppColorMap.items():
+                tagName = f"pp_{name}"
+                try:
+                    daySummaryBox.tag_configure(tagName, foreground=color)
+                except tk.TclError:
+                    continue
+
+                start = "1.0"
+                pattern = f"{name}:"
+                while True:
+                    pos = daySummaryBox.search(pattern, start, tk.END)
+                    if not pos:
+                        break
+                    end = f"{pos}+{len(name)}c"
+                    daySummaryBox.tag_add(tagName, pos, end)
+                    start = f"{end}+1c"
             drawTimelineForDayKey(dStr)
 
         def getSelectedDayIdx():
