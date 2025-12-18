@@ -939,6 +939,7 @@ class TaskTimerApp:
             p["total"] = total
 
         histWin = tk.Toplevel(self.root)
+        histWin.iconbitmap(resourcePath("hourglass.ico"))
         histWin.title("History")
         histWin.configure(bg=self.bgColor)
         histWin.withdraw()
