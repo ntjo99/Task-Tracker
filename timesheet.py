@@ -1607,33 +1607,31 @@ class TaskTimerApp:
                 )
 
             # --- Draw Legend (Key) ---
-            legendY = marginTop
-            legendX = plotAreaRight + 10 # Start the legend immediately after the plot area, plus a small gap
+            legendX = plotAreaRight + 10  # right of plot
+            rect_size = 10
+            rect_gap = 4
 
-            # Task order is tasks, which is sorted, matching the row order (Change B)
-            for task in tasks: 
+            # Center each legend row on the same Y as the task row centers
+            legendY = marginTop + (rowHeight - rect_size) / 2.0
+
+            for task in tasks:
                 color = colorMap[task]
-                
-                rect_size = 10
-                rect_gap = 4
-                row_step = 14
 
-                # Draw color box
                 timelineCanvas.create_rectangle(
                     legendX, legendY, legendX + rect_size, legendY + rect_size,
                     fill=color,
                     outline=""
                 )
-                # Draw task label
                 timelineCanvas.create_text(
                     legendX + rect_size + rect_gap,
-                    legendY + rect_size/2,
+                    legendY + rect_size / 2.0,
                     text=task,
                     anchor="w",
                     fill="#9ca3af",
                     font=("Segoe UI", 7)
                 )
-                legendY += row_step
+
+                legendY += rowHeight
 
         def showTooltip(event):
             items = timelineCanvas.find_withtag("current")
