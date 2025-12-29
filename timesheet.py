@@ -241,9 +241,9 @@ class TaskTimerApp:
             try:
                 with open(self.realPath, "w", encoding="utf-8") as f:
                     for name in desired_tasks:
-                        f.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False) + "\n")
+                        f.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False, separators=(',',':')) + "\n")
                     for t, g in desired_groups.items():
-                        f.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False) + "\n")
+                        f.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False, separators=(',',':')) + "\n")
                 self.dataFile = self.realPath
             except Exception:
                 pass
@@ -274,10 +274,10 @@ class TaskTimerApp:
             tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, dir=dirpath)
             # write fresh task lines
             for name in desired_tasks:
-                tmp.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False) + "\n")
+                tmp.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False, separators=(',',':')) + "\n")
             # write fresh group lines
             for t, g in desired_groups.items():
-                tmp.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False) + "\n")
+                tmp.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False, separators=(',',':')) + "\n")
             # append preserved history / other lines
             for l in preserved_lines:
                 if l == "":
@@ -324,10 +324,10 @@ class TaskTimerApp:
             try:
                 with open(self.realPath, "w", encoding="utf-8") as f:
                     for name in list(self.rows.keys()):
-                        f.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False) + "\n")
+                        f.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False, separators=(',',':')) + "\n")
                     for t, g in (self.groups or {}).items():
-                        f.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False) + "\n")
-                    f.write(json.dumps(new_obj, ensure_ascii=False) + "\n")
+                        f.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False, separators=(',',':')) + "\n")
+                    f.write(json.dumps(new_obj, ensure_ascii=False, separators=(',',':')) + "\n")
                 self.dataFile = self.realPath
             except Exception:
                 pass
@@ -353,7 +353,7 @@ class TaskTimerApp:
                     tmp.write(line + "\n")
 
             # Append the new history record at the end.
-            tmp.write(json.dumps(new_obj, ensure_ascii=False) + "\n")
+            tmp.write(json.dumps(new_obj, ensure_ascii=False, separators=(',',':')) + "\n")
             tmp.flush()
             tmp.close()
             os.replace(tmp.name, self.realPath)
