@@ -5,6 +5,7 @@ import os
 import sys
 import json
 import tempfile
+import hashlib
 from datetime import date, timedelta, datetime
 
 def resourcePath(relPath):
@@ -1296,7 +1297,19 @@ class TaskTimerApp:
             fg=self.textColor,
             bg=self.bgColor
         )
-        ppSummaryLabel.grid(row=2, column=0, columnspan=2, sticky="w")
+        ppSummaryLabel.grid(row=2, column=0, sticky="w")
+
+        ppChartModeBtn = tk.Button(
+            textFrame,
+            text="Area",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat"
+        )
+        ppChartModeBtn.grid(row=2, column=1, sticky="e")
 
         ppSummaryBox = tk.Text(
             textFrame,
@@ -1307,7 +1320,7 @@ class TaskTimerApp:
             highlightthickness=0,
             font=("Segoe UI", 10)
         )
-        ppSummaryBox.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+        ppSummaryBox.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
         ppPieCanvas = tk.Canvas(
             textFrame,
             bg="#1b1f24",
@@ -1382,7 +1395,7 @@ class TaskTimerApp:
         )
         clearGroupBtn.grid(row=0, column=1, padx=4)
 
-        current = {"ppIndex": 0, "timelineMode": "gantt", "dayKey": None}
+        current = {"ppIndex": 0, "timelineMode": "gantt", "ppChartMode": "pie", "dayKey": None}
         allTasks = collectAllTasks()
         taskNames = list(allTasks)
 
@@ -1490,15 +1503,66 @@ class TaskTimerApp:
                 return ""
             return None
 
+        def computePayPeriodColorMap(taskAgg):
+            nonlocal ppColorMap
+
+            ppColorMap = {}
+            if not taskAgg:
+                return ppColorMap
+
+            items = sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True)
+
+            colorFamilies = [
+                {"base": "#3f8cff", "shades": ["#60a5fa", "#1d4ed8", "#93c5fd"]},
+                {"base": "#10b981", "shades": ["#34d399", "#047857", "#6ee7b7"]},
+                {"base": "#f97316", "shades": ["#fb923c", "#c2410c", "#fed7aa"]},
+                {"base": "#e11d48", "shades": ["#fb7185", "#9f1239", "#fecdd3"]},
+                {"base": "#8b5cf6", "shades": ["#a855f7", "#6d28d9", "#ddd6fe"]},
+                {"base": "#06b6d4", "shades": ["#0ea5e9", "#0891b2", "#bae6fd"]},
+                {"base": "#facc15", "shades": ["#eab308", "#ca8a04", "#fef08a"]},
+                {"base": "#6366f1", "shades": ["#4f46e5", "#312e81", "#c7d2fe"]},
+            ]
+
+            def stable_int(s: str):
+                return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
+
+            groups = {}
+            ungrouped = []
+            for name, hours in items:
+                if hours <= 0:
+                    continue
+                g = self.groups.get(name)
+                if g:
+                    groups.setdefault(g, []).append(name)
+                else:
+                    ungrouped.append(name)
+
+            for gname, tasks_in_group in groups.items():
+                fam_idx = stable_int(gname) % len(colorFamilies)
+                fam = colorFamilies[fam_idx]
+                shades = [fam["base"]] + fam["shades"]
+                for taskName in sorted(tasks_in_group):
+                    shade_idx = stable_int(taskName) % len(shades)
+                    ppColorMap[taskName] = shades[shade_idx]
+
+            for taskName in sorted(ungrouped):
+                fam_idx = stable_int(taskName) % len(colorFamilies)
+                fam = colorFamilies[fam_idx]
+                ppColorMap[taskName] = fam["base"]
+
+            return ppColorMap
+
         def drawPayPeriodPie(total, taskAgg):
             nonlocal pieSlices, ppColorMap
 
             ppPieCanvas.delete("all")
             pieSlices = {}
-            ppColorMap = {}
 
             if total <= 0 or not taskAgg:
                 return
+
+            if not ppColorMap:
+                computePayPeriodColorMap(taskAgg)
 
             ppPieCanvas.update_idletasks()
             w = ppPieCanvas.winfo_width() or 160
@@ -1513,55 +1577,13 @@ class TaskTimerApp:
             r = size / 2
 
             items = sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True)
-            #TODO: settings for color preferences
-            colorFamilies = [
-                {"base": "#3f8cff", "shades": ["#60a5fa", "#1d4ed8", "#93c5fd"]},  # blue
-                {"base": "#10b981", "shades": ["#34d399", "#047857", "#6ee7b7"]},  # green
-                {"base": "#f97316", "shades": ["#fb923c", "#c2410c", "#fed7aa"]},  # orange
-                {"base": "#e11d48", "shades": ["#fb7185", "#9f1239", "#fecdd3"]},  # red
-                {"base": "#8b5cf6", "shades": ["#a855f7", "#6d28d9", "#ddd6fe"]},  # purple
-                {"base": "#06b6d4", "shades": ["#0ea5e9", "#0891b2", "#bae6fd"]},  # cyan
-                {"base": "#facc15", "shades": ["#eab308", "#ca8a04", "#fef08a"]},  # yellow
-                {"base": "#6366f1", "shades": ["#4f46e5", "#312e81", "#c7d2fe"]},  # indigo
-            ]
-
-            groups = {}
-            ungrouped = []
-            for name, hours in items:
-                if hours <= 0:
-                    continue
-                g = self.groups.get(name)
-                if g:
-                    groups.setdefault(g, []).append(name)
-                else:
-                    ungrouped.append(name)
-
-            groupNames = sorted(groups.keys())
-            taskColor = {}
-
-            # grouped tasks: same family, base + shades
-            for idx, g in enumerate(groupNames):
-                fam = colorFamilies[idx % len(colorFamilies)]
-                shades = [fam["base"]] + fam["shades"]
-                for i, taskName in enumerate(sorted(groups[g])):
-                    c = shades[i % len(shades)]
-                    taskColor[taskName] = c
-                    ppColorMap[taskName] = c
-
-            # ungrouped tasks: only main/base colors
-            offset = len(groupNames)
-            for j, taskName in enumerate(sorted(ungrouped)):
-                fam = colorFamilies[(offset + j) % len(colorFamilies)]
-                c = fam["base"]
-                taskColor[taskName] = c
-                ppColorMap[taskName] = c
 
             startAngle = 0.0
             for name, hours in items:
                 if hours <= 0:
                     continue
                 extent = 360.0 * (hours / total)
-                color = taskColor.get(name, self.accentColor)
+                color = ppColorMap.get(name, self.accentColor)
                 labelText = f"{name} ({hours:.1f}h, {hours / total * 100:.0f}%)"
 
                 item = ppPieCanvas.create_arc(
@@ -1576,6 +1598,149 @@ class TaskTimerApp:
                 )
                 pieSlices[item] = labelText
                 startAngle += extent
+
+        def drawPayPeriodStackedArea(period, taskAgg):
+            nonlocal pieSlices, ppColorMap
+
+            ppPieCanvas.delete("all")
+            pieSlices = {}
+
+            days = sorted(period.get("days", []))
+            if not days or not taskAgg:
+                return
+
+            if not ppColorMap:
+                computePayPeriodColorMap(taskAgg)
+
+            perDayAgg = []
+            dayLabels = []
+            maxDayTotal = 0.0
+
+            for dStr in days:
+                dayAgg, dayTotal = parseDaySummary(dStr)
+                perDayAgg.append(dayAgg)
+                maxDayTotal = max(maxDayTotal, dayTotal)
+                try:
+                    d = date.fromisoformat(dStr)
+                    dayLabels.append(d.strftime("%m-%d"))
+                except ValueError:
+                    dayLabels.append(dStr)
+
+            if maxDayTotal <= 0:
+                return
+
+            tasksOrdered = [k for k, v in sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True) if v > 0]
+            if not tasksOrdered:
+                return
+
+            ppPieCanvas.update_idletasks()
+            w = ppPieCanvas.winfo_width() or 240
+            h = ppPieCanvas.winfo_height() or 160
+
+            marginLeft = 28
+            marginRight = 10
+            marginTop = 10
+            marginBottom = 22
+
+            left = marginLeft
+            right = max(left + 1, w - marginRight)
+            top = marginTop
+            bottom = max(top + 1, h - marginBottom)
+            plotW = max(1, right - left)
+            plotH = max(1, bottom - top)
+
+            n = len(days)
+
+            ppPieCanvas.create_line(left, bottom, right, bottom, fill="#6b7280")
+
+            if n == 1:
+                barWidth = min(max(30.0, plotW * 0.25), 70.0)
+                x1 = left + (plotW - barWidth) / 2.0
+                x2 = x1 + barWidth
+
+                y = bottom
+                for i, task in enumerate(tasksOrdered):
+                    v = float(perDayAgg[0].get(task, 0.0))
+                    if v <= 0:
+                        continue
+                    hPx = int(round((v / maxDayTotal) * plotH))
+                    hPx = max(1, min(hPx, int(round(y - top))))
+                    y2 = y
+                    y1 = max(top, y - hPx)
+
+                    item = ppPieCanvas.create_rectangle(
+                        x1, y1, x2, y2,
+                        fill=ppColorMap.get(task, self.accentColor),
+                        outline=""
+                    )
+                    pieSlices[item] = f"{task} ({v:.1f}h)"
+                    y = y1
+
+                ppPieCanvas.create_text(
+                    left, bottom + 4,
+                    text=dayLabels[0],
+                    fill="#9ca3af",
+                    anchor="nw",
+                    font=("Segoe UI", 7)
+                )
+                return
+
+            xs = [left + (i / float(n - 1)) * plotW for i in range(n)]
+            cumulative = [0.0 for _ in range(n)]
+
+            for task in tasksOrdered:
+                vals = [float(dayAgg.get(task, 0.0)) for dayAgg in perDayAgg]
+                if sum(vals) <= 0:
+                    continue
+
+                topPts = []
+                basePts = []
+                for i in range(n):
+                    base = cumulative[i]
+                    topV = base + vals[i]
+
+                    baseY = bottom - (base / maxDayTotal) * plotH
+                    topY = bottom - (topV / maxDayTotal) * plotH
+
+                    topPts.append((xs[i], topY))
+                    basePts.append((xs[i], baseY))
+                    cumulative[i] = topV
+
+                points = []
+                for x, y in topPts:
+                    points.extend([x, y])
+                for x, y in reversed(basePts):
+                    points.extend([x, y])
+
+                color = ppColorMap.get(task, self.accentColor)
+                item = ppPieCanvas.create_polygon(points, fill=color, outline="")
+                pieSlices[item] = f"{task} ({taskAgg.get(task, 0.0):.1f}h)"
+
+            # choose label indices to avoid crowding; always include first and last
+            label_spacing_px = 70  # desired min pixels between labels
+            max_labels = max(2, min(n, int(plotW // label_spacing_px)))
+            indices = {0, n - 1}
+            if max_labels > 2 and n > 2:
+                step_float = (n - 1) / (max_labels - 1)
+                for k in range(1, max_labels - 1):
+                    idx = int(round(k * step_float))
+                    # keep within sensible interior range
+                    idx = min(max(idx, 1), n - 2)
+                    indices.add(idx)
+            indices_list = sorted(indices)
+
+            for idx in indices_list:
+                x = xs[idx]
+                # clamp to canvas bounds so text isn't clipped
+                x = max(left + 2, min(x, left + plotW - 2))
+                ppPieCanvas.create_text(
+                    x,
+                    bottom + 4,
+                    text=dayLabels[idx],
+                    fill="#9ca3af",
+                    anchor="n",
+                    font=("Segoe UI", 7)
+                )
 
         def showPieTooltip(event):
             items = ppPieCanvas.find_withtag("current")
@@ -1632,7 +1797,12 @@ class TaskTimerApp:
             agg = p.get("agg", {})
             total = p.get("total", 0.0)
 
-            drawPayPeriodPie(total, agg)
+            computePayPeriodColorMap(agg)
+
+            if current.get("ppChartMode") == "area":
+                drawPayPeriodStackedArea(p, agg)
+            else:
+                drawPayPeriodPie(total, agg)
 
             lines = formatLines(total, agg)
 
@@ -1942,6 +2112,12 @@ class TaskTimerApp:
             if current.get("dayKey"):
                 drawTimelineForDayKey(current["dayKey"])
 
+        def togglePayPeriodChartMode():
+            current["ppChartMode"] = "area" if current.get("ppChartMode") == "pie" else "pie"
+            isArea = (current.get("ppChartMode") == "area")
+            ppChartModeBtn.config(text=("Pie" if isArea else "Area"))
+            showPayPeriodSummary()
+
 
         def showDaySummary(dayIdx):
             ppIdx = current["ppIndex"]
@@ -2094,6 +2270,7 @@ class TaskTimerApp:
         taskListbox.bind("<<ListboxSelect>>", onTaskSelect)
         setGroupBtn.config(command=setGroup)
         clearGroupBtn.config(command=clearGroup)
+        ppChartModeBtn.config(command=togglePayPeriodChartMode)
 
         btnFrame = tk.Frame(histWin, bg=self.bgColor)
         btnFrame.grid(row=1, column=0, columnspan=4, padx=8, pady=(0, 8), sticky="e")
