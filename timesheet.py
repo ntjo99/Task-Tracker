@@ -830,9 +830,11 @@ class TaskTimerApp:
         if isinstance(existingEntry, dict):
             existingTimeline = existingEntry.get("timeline", []) or []
 
-        if choice == "append" and existingTimeline:
+        if choice == "append":
+            # keep any existing timeline entries and append today's segments
             timeline = existingTimeline + list(self.dayTimeline)
         else:
+            # overwrite semantics: replace timeline with today's segments
             timeline = list(self.dayTimeline)
 
         self.history[todayKey] = {
@@ -987,7 +989,7 @@ class TaskTimerApp:
             if isinstance(existingEntry, dict):
                 existingTimeline = existingEntry.get("timeline", []) or []
 
-            if choice == "append" and existingTimeline:
+            if choice == "append":
                 timeline = existingTimeline + list(self.dayTimeline)
             else:
                 timeline = list(self.dayTimeline)
@@ -1253,6 +1255,20 @@ class TaskTimerApp:
         )
         timelineLabel.grid(row=0, column=1, sticky="w")
 
+
+        timelineModeBtn = tk.Button(
+            textFrame,
+            text="Stacked",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=lambda: toggleTimelineMode()
+        )
+        timelineModeBtn.grid(row=0, column=1, sticky="e")
+
         daySummaryBox = tk.Text(
             textFrame,
             bg="#1b1f24",
@@ -1366,7 +1382,7 @@ class TaskTimerApp:
         )
         clearGroupBtn.grid(row=0, column=1, padx=4)
 
-        current = {"ppIndex": 0}
+        current = {"ppIndex": 0, "timelineMode": "gantt", "dayKey": None}
         allTasks = collectAllTasks()
         taskNames = list(allTasks)
 
@@ -1652,15 +1668,7 @@ class TaskTimerApp:
             if not segments:
                 return
 
-            # --- Calculate Dynamic Time Range ---
             min_sec, max_sec = 24 * 3600, 0
-            valid_segments = []
-            
-            from datetime import datetime
-            
-            for seg in segments:
-                            min_sec = 24 * 3600
-            max_sec = 0
             valid_segments = []
 
             for seg in segments:
@@ -1695,40 +1703,31 @@ class TaskTimerApp:
             spanEndSec = min(24 * 3600, ((max_sec + 3599) // 3600) * 3600)
             spanSec = max(60.0, spanEndSec - spanStartSec)
 
-            # --- Canvas Setup and Margins ---
             timelineCanvas.update_idletasks()
             width = timelineCanvas.winfo_width() or 260
             height = timelineCanvas.winfo_height() or 140
 
-            # Margin adjusted for X-axis cutoff (Change C)
             marginLeft = 10
             marginRight = 10
             marginTop = 10
-            # Increased marginBottom to prevent X-axis labels from being cut off (Change C)
             marginBottom = 30
 
             areaTop = marginTop
             areaBottom = height - marginBottom
             areaBottom = areaTop + 10 if areaBottom <= areaTop else areaBottom
 
-            # --- Task Mapping and Row Calculation (Change B) ---
-            # The list of tasks defines the row order AND the key order.
-            tasks = sorted({seg["task"] for seg in valid_segments}) # Task order is now fixed
+            tasks = sorted({seg["task"] for seg in valid_segments})
 
-            # --- Key/Plot Space Allocation (Change A) ---
-            keyWidthRatio = 0.25 # Allocate 25% of the width for the key
+            keyWidthRatio = 0.25
             keyWidth = width * keyWidthRatio
-            
-            # Inner plotting area is the width minus the key area and margins
             innerWidth = max(1, width - marginLeft - marginRight - keyWidth)
-            plotAreaRight = marginLeft + innerWidth # The X-coordinate where the plot area ends and the key begins
+            plotAreaRight = marginLeft + innerWidth
 
             nTasks = max(1, len(tasks))
             rowGap = 4
             totalHeight = areaBottom - areaTop
             rowHeight = max(6, (totalHeight - rowGap * (nTasks - 1)) / nTasks)
 
-            # taskToRow is built from the sorted tasks list
             taskToRow = {t: i for i, t in enumerate(tasks)}
 
             # Color map: match the pay period pie colors (including group shading)
@@ -1739,18 +1738,84 @@ class TaskTimerApp:
                 else:
                     colorMap[task] = ppColorMap.get(task, self.accentColor)
 
-            # --- Draw Segments (Horizontal Bars) ---
+            mode = current.get("timelineMode", "gantt")
+            if mode == "stacked":
+                totals = {}
+                totalSpan = 0.0
+
+                for seg in valid_segments:
+                    dur = max(0.0, float(seg["endSec"] - seg["startSec"]))
+                    t = seg["task"]
+                    totals[t] = totals.get(t, 0.0) + dur
+                    totalSpan += dur
+
+                if totalSpan <= 0:
+                    return
+
+                barWidth = min(max(24.0, innerWidth * 0.30), 70.0)
+
+                x1i = int(round(marginLeft + (innerWidth - barWidth) / 2.0))
+                x2i = int(round(x1i + barWidth))
+
+                yTop = int(round(areaTop))
+                yBottom = int(round(areaBottom))
+                totalPx = max(1, yBottom - yTop)
+
+                drawTasks = [t for t in tasks if totals.get(t, 0.0) > 0.0]
+
+                y = yTop
+                for i, task in enumerate(drawTasks):
+                    dur = totals[task]
+
+                    if i == len(drawTasks) - 1:
+                        y2 = yBottom
+                    else:
+                        hPx = int(round((dur / totalSpan) * totalPx))
+                        hPx = max(1, min(hPx, yBottom - y))
+                        y2 = y + hPx
+
+                    item = timelineCanvas.create_rectangle(
+                        x1i, y, x2i, y2,
+                        fill=colorMap[task],
+                        outline=""
+                    )
+                    rectTaskMap[item] = f"{task} {dur/3600.0:.2f}h"
+                    y = y2
+
+
+                legendX = plotAreaRight + 10
+                rect_size = 10
+                rect_gap = 4
+                legendY = marginTop + (rowHeight - rect_size) / 2.0
+
+                for task in tasks:
+                    color = colorMap[task]
+                    timelineCanvas.create_rectangle(
+                        legendX, legendY, legendX + rect_size, legendY + rect_size,
+                        fill=color,
+                        outline=""
+                    )
+                    timelineCanvas.create_text(
+                        legendX + rect_size + rect_gap,
+                        legendY + rect_size / 2.0,
+                        text=task,
+                        anchor="w",
+                        fill="#9ca3af",
+                        font=("Segoe UI", 7)
+                    )
+                    legendY += rowHeight
+
+                return
+
             for seg in valid_segments:
                 task = seg["task"]
                 startSec = seg["startSec"]
                 endSec = seg["endSec"]
-                
-                # Y calculation remains the same
+
                 rowIndex = taskToRow.get(task, 0)
                 y1 = areaTop + rowIndex * (rowHeight + rowGap)
                 y2 = y1 + rowHeight
 
-                # X calculation now uses the limited innerWidth
                 x1 = marginLeft + ((startSec - spanStartSec) / spanSec) * innerWidth
                 x2 = marginLeft + ((endSec - spanStartSec) / spanSec) * innerWidth
 
@@ -1764,27 +1829,22 @@ class TaskTimerApp:
                 labelText = f"{task} {seg['hStart']:02d}:{seg['mStart']:02d}–{seg['hEnd']:02d}:{seg['mEnd']:02d}"
                 rectTaskMap[item] = labelText
 
-
-            # --- Draw Time Axis (X-Axis) ---
-            # X-Axis is drawn across the plot area only
             axisY = areaBottom + 4
             tickY1 = axisY
             tickY2 = axisY + 4
-            labelY = axisY + 10 # This position is safer due to increased marginBottom (Change C)
-            
+            labelY = axisY + 10
+
             span_hours = spanSec / 3600.0
-            
             if span_hours < 3:
                 step_sec = 1800
             elif span_hours < 8:
                 step_sec = 3600
             else:
-                step_sec = 10800 
+                step_sec = 10800
 
             first_tick_sec = (spanStartSec // step_sec + 1) * step_sec
             ticks_sec = sorted(list(set([spanStartSec, spanEndSec] + list(range(first_tick_sec, spanEndSec, step_sec)))))
-            
-            # Draw line up to the new plotAreaRight boundary
+
             timelineCanvas.create_line(marginLeft, axisY, plotAreaRight, axisY, fill="#6b7280")
 
             for sec in ticks_sec:
@@ -1792,11 +1852,9 @@ class TaskTimerApp:
                     continue
 
                 x = marginLeft + ((sec - spanStartSec) / spanSec) * innerWidth
-                
-                # Ensure label is not drawn past the plot boundary
                 if x > plotAreaRight:
-                     continue 
-                     
+                    continue
+
                 hour = int(sec // 3600) % 24
                 time_label = f"{hour:02d}"
 
@@ -1807,17 +1865,13 @@ class TaskTimerApp:
                     font=("Segoe UI", 7)
                 )
 
-            # --- Draw Legend (Key) ---
-            legendX = plotAreaRight + 10  # right of plot
+            legendX = plotAreaRight + 10
             rect_size = 10
             rect_gap = 4
-
-            # Center each legend row on the same Y as the task row centers
             legendY = marginTop + (rowHeight - rect_size) / 2.0
 
             for task in tasks:
                 color = colorMap[task]
-
                 timelineCanvas.create_rectangle(
                     legendX, legendY, legendX + rect_size, legendY + rect_size,
                     fill=color,
@@ -1831,7 +1885,6 @@ class TaskTimerApp:
                     fill="#9ca3af",
                     font=("Segoe UI", 7)
                 )
-
                 legendY += rowHeight
 
         def showTooltip(event):
@@ -1879,6 +1932,16 @@ class TaskTimerApp:
                 tooltip["win"] = None
             tooltip["item"] = None
 
+        def toggleTimelineMode():
+            current["timelineMode"] = "stacked" if current.get("timelineMode") == "gantt" else "gantt"
+
+            isStacked = (current["timelineMode"] == "stacked")
+            timelineModeBtn.config(text=("Timeline" if isStacked else "Stacked"))
+            timelineLabel.config(text=("Stacked" if isStacked else "Timeline"))
+
+            if current.get("dayKey"):
+                drawTimelineForDayKey(current["dayKey"])
+
 
         def showDaySummary(dayIdx):
             ppIdx = current["ppIndex"]
@@ -1894,6 +1957,7 @@ class TaskTimerApp:
                 return
 
             dStr = period["days"][dayIdx]
+            current["dayKey"] = dStr
             entry = self.history.get(dStr, "") or ""
             if isinstance(entry, dict):
                 raw = entry.get("summary", "") or ""
