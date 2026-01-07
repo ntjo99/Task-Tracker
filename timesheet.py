@@ -69,7 +69,7 @@ class TaskTimerApp:
             self.dataFile = self.realPath
             self.using_example = False
         self.dayTimeline = []
-        self.minSegmentSeconds = 6 * 60
+        self.minSegmentSeconds = 30
 
         self.buildUi()
         self.loadData()
