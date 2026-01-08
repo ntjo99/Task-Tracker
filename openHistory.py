@@ -2,6 +2,7 @@ from datetime import date, timedelta, datetime
 import tkinter as tk
 import sys
 import hashlib
+import openEdit
 
 def resourcePath(relPath):
 	if hasattr(sys, "_MEIPASS"):
@@ -121,6 +122,25 @@ def openHistory(self):
                 total += dayTotal
             p["agg"] = agg
             p["total"] = total
+
+        # helper to recompute period aggregates after edits
+        def updatePeriods():
+            nonlocal periods
+            for p in periods:
+                agg = {}
+                total = 0.0
+                for dStr in p.get("days", []):
+                    dayAgg, dayTotal = parseDaySummary(dStr)
+                    for k, v in dayAgg.items():
+                        agg[k] = agg.get(k, 0.0) + v
+                    total += dayTotal
+                p["agg"] = agg
+                p["total"] = total
+            # ensure UI shows recalculated data
+            try:
+                showPayPeriodSummary()
+            except Exception:
+                pass
 
         if getattr(self, "histWin", None) is not None and self.histWin.winfo_exists():
             histWin = self.histWin
@@ -244,9 +264,12 @@ def openHistory(self):
         )
         timelineLabel.grid(row=0, column=1, sticky="w")
 
+        # control frame to hold timeline toggle and edit buttons
+        timelineControlFrame = tk.Frame(textFrame, bg=self.bgColor)
+        timelineControlFrame.grid(row=0, column=1, sticky="e")
 
         timelineModeBtn = tk.Button(
-            textFrame,
+            timelineControlFrame,
             text="Stacked",
             font=("Segoe UI", 9, "bold"),
             bg="#1b1f24",
@@ -256,7 +279,26 @@ def openHistory(self):
             relief="flat",
             command=lambda: toggleTimelineMode()
         )
-        timelineModeBtn.grid(row=0, column=1, sticky="e")
+        timelineModeBtn.pack(side="right")
+
+        editDayBtn = tk.Button(
+            timelineControlFrame,
+            text="Edit",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            # pass the available task list so the editor can show a row for every task
+            command=lambda: openEdit.open_day_editor(
+                self, histWin, current.get("dayKey"), periods, current,
+                showPayPeriodSummary, refreshDays, showDaySummary, ppColorMap,
+                updatePeriods,
+                sorted(set(list(self.rows.keys()) + list(allTasks)))
+            )
+        )
+        editDayBtn.pack(side="right", padx=(0,10))
 
         daySummaryBox = tk.Text(
             textFrame,
