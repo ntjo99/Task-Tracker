@@ -7,6 +7,7 @@ import json
 import tempfile
 from datetime import date, timedelta, datetime
 from openHistory import openHistory as openHistoryImpl
+from settings import openSettings as openSettingsImpl, loadSettings as loadSettingsImpl
 
 def resourcePath(relPath):
 	if hasattr(sys, "_MEIPASS"):
@@ -19,14 +20,21 @@ class TaskTimerApp:
         self.root.title("Task Timer")
         self.root.iconbitmap(resourcePath("hourglass.ico"))
 
+        self.settings = loadSettingsImpl(os.path.join(self.getBaseDir(), "settings.json"))
+        self.minSegmentSeconds = self.settings["minRecordedMinutes"] * 60
+        self.workDayStart = self.settings["workDayStart"]
+        self.workDayEnd = self.settings["workDayEnd"]
+        self.roundToHours = self.settings["roundToHours"]
+
+
         self.bgColor = "#111315"
         self.cardColor = "#1e2227"
         self.accentColor = "#3f8cff"
         self.textColor = "#e5e5e5"
         self.activeColor = "#254a7a"
 
-        self.baseWidth = 400
-        self.baseHeight = 260
+        self.baseWidth = int(self.settings.get("mainWindowWidth", 400))
+        self.baseHeight = int(self.settings.get("mainWindowHeight", 400))
         self.rowHeight = 40
 
         self.root.configure(bg=self.bgColor)
@@ -69,7 +77,6 @@ class TaskTimerApp:
             self.dataFile = self.realPath
             self.using_example = False
         self.dayTimeline = []
-        self.minSegmentSeconds = 30
 
         self.buildUi()
         self.loadData()
@@ -87,6 +94,7 @@ class TaskTimerApp:
         topBar.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 4), sticky="we")
         topBar.columnconfigure(0, weight=1)
         topBar.columnconfigure(1, weight=0)
+        topBar.columnconfigure(2, weight=0)
 
         title = tk.Label(
             topBar,
@@ -96,6 +104,19 @@ class TaskTimerApp:
             bg=self.bgColor
         )
         title.grid(row=0, column=0, sticky="w")
+
+        settingsBtn = tk.Button(
+            topBar,
+            text="⚙",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=self.openSettings
+        )
+        settingsBtn.grid(row=0, column=1, sticky="e", padx=(6, 0))
 
         historyBtn = tk.Button(
             topBar,
@@ -108,7 +129,7 @@ class TaskTimerApp:
             relief="flat",
             command=self.openHistory
         )
-        historyBtn.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        historyBtn.grid(row=0, column=2, sticky="e", padx=(8, 0))
 
         subtitle = tk.Label(
             self.root,
@@ -390,9 +411,7 @@ class TaskTimerApp:
 
     def adjustWindowHeight(self):
         self.root.update_idletasks()
-        width = self.root.winfo_width()
-        if width <= 0:
-            width = self.baseWidth
+        width = self.baseWidth
         count = len(self.rows)
         height = self.baseHeight + self.rowHeight * count + 20
         self.root.geometry(f"{width}x{height}")
@@ -520,6 +539,37 @@ class TaskTimerApp:
             "start": startIso,
             "end": endIso
         })
+
+    def _roundTimelineEdgesToHour(self, timeline):
+        if not self.roundToHours or not timeline:
+            return timeline
+
+        def parseIso(s):
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
+
+        def fmtIso(dtObj):
+            return dtObj.strftime("%Y-%m-%dT%H:%M:%S")
+
+        first = timeline[0]
+        last = timeline[-1]
+
+        firstStart = parseIso(first.get("start"))
+        if firstStart is not None:
+            if firstStart.minute <= 5:
+                firstStart = firstStart.replace(minute=0, second=0, microsecond=0)
+                first["start"] = fmtIso(firstStart)
+
+        lastEnd = parseIso(last.get("end"))
+        if lastEnd is not None:
+            if lastEnd.minute >= 55:
+                lastEnd = (lastEnd.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+                last["end"] = fmtIso(lastEnd)
+
+        return timeline
+    
 
     def _closeActiveSegment(self, now=None):
         if now is None:
@@ -857,6 +907,8 @@ class TaskTimerApp:
             # overwrite semantics: replace timeline with today's segments
             timeline = list(self.dayTimeline)
 
+        timeline = self._roundTimelineEdgesToHour(timeline)
+
         self.history[todayKey] = {
             "summary": merged,
             "timeline": timeline
@@ -1014,6 +1066,8 @@ class TaskTimerApp:
             else:
                 timeline = list(self.dayTimeline)
 
+            timeline = self._roundTimelineEdgesToHour(timeline)
+
             self.history[todayKey] = {
                 "summary": merged,
                 "timeline": timeline
@@ -1039,10 +1093,22 @@ class TaskTimerApp:
         self.refreshRowStyles()
         self.saveData()
     
+    def openSettings(self):
+        return openSettingsImpl(self)
+
     def openHistory(self):
         return openHistoryImpl(self)
 
 if __name__ == "__main__":
     root = tk.Tk()
+    root.withdraw()
+
     app = TaskTimerApp(root)
+
+    root.update_idletasks()
+    w = max(app.baseWidth, root.winfo_reqwidth())
+    h = root.winfo_reqheight()
+    root.geometry(f"{w}x{h}")
+
+    root.deiconify()
     root.mainloop()
