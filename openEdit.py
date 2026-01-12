@@ -381,6 +381,10 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
         # finalize creation (if creating) or finalize drag/resize (existing)
         cw, ch = layout_dimensions()
         x_rel,y_rel = canvas.canvasx(ev.x), canvas.canvasy(ev.y)
+        workStartSecs = hhmm_to_secs(self.workDayStart, 9 * 3600)
+        workEndSecs   = hhmm_to_secs(self.workDayEnd, 17 * 3600)
+        snap_threshold_s = 10 * 60  # 10 minutes in seconds
+        
         # If user was creating (we started a provisional seg on press)
         if drag.get("creating") and drag.get("item"):
             iid = drag["item"]
@@ -399,6 +403,13 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
             end_s = x_to_seconds(x2, cw)
             if end_s <= start_s or (end_s - start_s) < click_min_s:
                 end_s = min(86400-1, start_s + click_min_s)
+            
+            # snap to work hours if within threshold
+            if abs(start_s - workStartSecs) <= snap_threshold_s:
+                start_s = workStartSecs
+            if abs(end_s - workEndSecs) <= snap_threshold_s:
+                end_s = workEndSecs
+            
             # commit provisional segment
             segs[sidx]["start"] = secs_to_iso(start_s)
             segs[sidx]["end"] = secs_to_iso(end_s)
@@ -497,6 +508,15 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
         # convert coords back to times/rows and commit
         start_s = x_to_seconds(x1, cw)
         end_s = x_to_seconds(x2, cw)
+        
+        # snap to work hours if within threshold
+        if abs(start_s - workStartSecs) <= snap_threshold_s:
+            start_s = workStartSecs
+            x1 = seconds_to_x(start_s, cw)
+        if abs(end_s - workEndSecs) <= snap_threshold_s:
+            end_s = workEndSecs
+            x2 = seconds_to_x(end_s, cw)
+        
         if end_s <= start_s or (end_s - start_s) < min_seg_s:
             # remove segment if too short
             try:
