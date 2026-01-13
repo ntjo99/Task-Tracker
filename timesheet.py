@@ -30,7 +30,6 @@ class TaskTimerApp:
         self.useTimesheetFunctions = self.settings.get("useTimesheetFunctions", True)
         self.autoChargeCodes = self.settings.get("autoChargeCodes", True)
 
-
         self.bgColor = "#111315"
         self.cardColor = "#1e2227"
         self.accentColor = "#3f8cff"
@@ -68,6 +67,8 @@ class TaskTimerApp:
 
         self.toastWindow = None
         self.toastTimer = None
+
+        self.validateEnvFile()
 
         baseDir = self.getBaseDir()
         # always write to tasks.jsonl. For reading: prefer tasks.jsonl, otherwise fall back to tasks.example.jsonl.
@@ -250,7 +251,7 @@ class TaskTimerApp:
             pady=10
         )
         toastLabel.pack()
-        
+
         self.root.update_idletasks()
         rx = self.root.winfo_rootx()
         ry = self.root.winfo_rooty()
@@ -258,12 +259,12 @@ class TaskTimerApp:
         
         self.toastWindow.update_idletasks()
         tw = self.toastWindow.winfo_width()
-        
+
         x = rx + (rw - tw) // 2
         y = ry + 20
-        
+
         self.toastWindow.geometry(f"+{x}+{y}")
-        
+
         def dismissToast():
             try:
                 if self.toastWindow is not None:
@@ -661,7 +662,7 @@ class TaskTimerApp:
         day = firstStart.date()
         workStart = datetime(day.year, day.month, day.day, workStartHour, workStartMinute, 0)
         workEnd = datetime(day.year, day.month, day.day, workEndHour, workEndMinute, 0)
-        
+
         if abs((firstStart - workStart).total_seconds()) <= 5 * 60:
             first["start"] = fmtIso(workStart)
 
@@ -682,16 +683,17 @@ class TaskTimerApp:
         try:
             self.punchSession = posting.newSession()
             posting.primeCookies(self.punchSession)
-            
+    
             _, loginJson = posting.login(self.punchSession)
-            
+    
             self.employeeId = posting.extractEmployeeId(loginJson)
-            
+    
             posting.saveCookies(self.punchSession)
-            
+    
             timesheetData = posting.copyPreviousTimesheet(self.punchSession, date.today().isoformat())
             self.timesheetId = timesheetData["timesheetId"]
         except Exception as e:
+            self.showToast(f"Login error: {str(e)}", timeout=5000, error=True)
             self.punchSession = None
             self.employeeId = None
             self.timesheetId = None
@@ -736,10 +738,10 @@ class TaskTimerApp:
     def punchOut(self):
         if not self.useTimesheetFunctions:
             return
-        
+
         if self.punchSession is None or self.employeeId is None:
             return
-        
+
         def _punchOutThread():
             try:
                 punchDt = datetime.now()
@@ -770,7 +772,7 @@ class TaskTimerApp:
                 self.showToast("Successfully clocked out!")
             except Exception as e:
                 self.showToast(f"✗ Clock out failed: {e}", error=True)
-        
+
         thread = threading.Thread(target=_punchOutThread, daemon=True)
         thread.start()
 
@@ -839,7 +841,6 @@ class TaskTimerApp:
                 self.showToast("Error posting charge codes", error=True)
 
         threading.Thread(target=job, daemon=True).start()
-
 
     def createDragGhost(self, name):
         if name not in self.rows:
@@ -1009,10 +1010,9 @@ class TaskTimerApp:
                     taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
 
             self.postChargeCodeHours(taskSecondsSnapshot)
-            
+
             # Punch out when closing with unsaved time
             self.punchOut()
-            
             self.hasUnsavedTime = False
             self.dayTimeline = []
 
@@ -1031,7 +1031,7 @@ class TaskTimerApp:
         self.dragStartY = 0
         self.refreshRowStyles()
         self.saveData()
-    
+
     def openSettings(self):
         return openSettingsImpl(self)
 
@@ -1041,25 +1041,25 @@ class TaskTimerApp:
     def clearDayData(self):
         if not messagebox.askyesno("Clear Day", "Clear all times and timeline for today? This cannot be undone."):
             return
-        
+
         now = time.time()
-        
+
         if self.currentTask is not None and self.currentStart is not None:
             self.currentTask = None
             self.currentStart = None
-        
+
         self.unassignedStart = None
         self.unassignedSeconds = 0.0
-        
+
         for name in self.tasks.keys():
             self.tasks[name] = 0.0
-        
+
         self.dayTimeline = []
-        
+
         todayKey = date.today().isoformat()
         if todayKey in self.history:
             del self.history[todayKey]
-        
+
         self.hasUnsavedTime = False
         self.refreshRowStyles()
         messagebox.showinfo("Cleared", "All times and timeline have been cleared.")
@@ -1450,6 +1450,36 @@ class TaskTimerApp:
             pass
         
         return chargeCodesByKey
+
+    def validateEnvFile(self):
+        envPath = os.path.join(self.getBaseDir(), "posting.env")
+        
+        required = ["BASE_URL", "EMAIL", "PASSWORD"]
+        missing = []
+        
+        if not os.path.exists(envPath):
+            missing = required
+        else:
+            try:
+                with open(envPath, "r", encoding="utf-8") as f:
+                    content = f.read()
+                for key in required:
+                    if f"{key}=" not in content:
+                        missing.append(key)
+                    else:
+                        # Check if value is actually set (not just empty)
+                        for line in content.split("\n"):
+                            if line.startswith(f"{key}="):
+                                value = line.split("=", 1)[1].strip()
+                                if not value:
+                                    missing.append(key)
+                                break
+            except Exception:
+                missing = required
+        
+        if missing:
+            msg = "Missing posting.env configuration:\n" + ", ".join(missing)
+            self.showToast(msg, timeout=5000, error=True)
 
 if __name__ == "__main__":
     root = tk.Tk()
