@@ -5,9 +5,11 @@ import os
 import sys
 import json
 import tempfile
+import threading
 from datetime import date, timedelta, datetime
 from openHistory import openHistory as openHistoryImpl
 from settings import openSettings as openSettingsImpl, loadSettings as loadSettingsImpl
+import posting
 
 def resourcePath(relPath):
 	if hasattr(sys, "_MEIPASS"):
@@ -25,6 +27,8 @@ class TaskTimerApp:
         self.workDayStart = self.settings["workDayStart"]
         self.workDayEnd = self.settings["workDayEnd"]
         self.roundToHours = self.settings["roundToHours"]
+        self.useTimesheetFunctions = self.settings.get("useTimesheetFunctions", True)
+        self.autoChargeCodes = self.settings.get("autoChargeCodes", True)
 
 
         self.bgColor = "#111315"
@@ -58,6 +62,12 @@ class TaskTimerApp:
         self.unassignedStart = None
 
         self.hasUnsavedTime = False
+        self.punchSession = None
+        self.employeeId = None
+        self.timesheetId = None
+
+        self.toastWindow = None
+        self.toastTimer = None
 
         baseDir = self.getBaseDir()
         # always write to tasks.jsonl. For reading: prefer tasks.jsonl, otherwise fall back to tasks.example.jsonl.
@@ -80,6 +90,7 @@ class TaskTimerApp:
 
         self.buildUi()
         self.loadData()
+        self.restoreTodayTimeline()
         self.relayoutRows()
         self.updateLoop()
 
@@ -89,12 +100,22 @@ class TaskTimerApp:
     def getBaseDir(self):
         return os.path.dirname(os.path.abspath(sys.argv[0]))
 
+    def restoreTodayTimeline(self):
+        """Restore timeline from today's saved entry if it exists"""
+        todayKey = date.today().isoformat()
+        entry = self.history.get(todayKey)
+        if isinstance(entry, dict):
+            timeline = entry.get("timeline", []) or []
+            if timeline:
+                self.dayTimeline = [dict(seg) for seg in timeline]
+
     def buildUi(self):
         topBar = tk.Frame(self.root, bg=self.bgColor)
         topBar.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 4), sticky="we")
         topBar.columnconfigure(0, weight=1)
         topBar.columnconfigure(1, weight=0)
         topBar.columnconfigure(2, weight=0)
+        topBar.columnconfigure(3, weight=0)
 
         title = tk.Label(
             topBar,
@@ -118,6 +139,19 @@ class TaskTimerApp:
         )
         settingsBtn.grid(row=0, column=1, sticky="e", padx=(6, 0))
 
+        clearBtn = tk.Button(
+            topBar,
+            text="Clear",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=self.clearDayData
+        )
+        clearBtn.grid(row=0, column=2, sticky="e", padx=(6, 0))
+
         historyBtn = tk.Button(
             topBar,
             text="History",
@@ -129,7 +163,7 @@ class TaskTimerApp:
             relief="flat",
             command=self.openHistory
         )
-        historyBtn.grid(row=0, column=2, sticky="e", padx=(8, 0))
+        historyBtn.grid(row=0, column=3, sticky="e", padx=(8, 0))
 
         subtitle = tk.Label(
             self.root,
@@ -138,7 +172,7 @@ class TaskTimerApp:
             fg="#9099a6",
             bg=self.bgColor
         )
-        subtitle.grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
+        subtitle.grid(row=2, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
 
         self.newTaskEntry = tk.Entry(
             self.root,
@@ -148,7 +182,7 @@ class TaskTimerApp:
             insertbackground=self.textColor,
             relief="flat"
         )
-        self.newTaskEntry.grid(row=2, column=0, padx=(12, 6), pady=6, sticky="we")
+        self.newTaskEntry.grid(row=3, column=0, padx=(12, 6), pady=6, sticky="we")
         self.newTaskEntry.bind("<Return>", self.onEntryReturn)
 
         self.addTaskButton = tk.Button(
@@ -162,10 +196,10 @@ class TaskTimerApp:
             relief="flat",
             command=self.addTask
         )
-        self.addTaskButton.grid(row=2, column=1, padx=(6, 12), pady=6, sticky="we")
+        self.addTaskButton.grid(row=3, column=1, padx=(6, 12), pady=6, sticky="we")
 
         self.tasksFrame = tk.Frame(self.root, bg=self.bgColor)
-        self.tasksFrame.grid(row=3, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="nwe")
+        self.tasksFrame.grid(row=4, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="nwe")
         self.tasksFrame.columnconfigure(0, weight=1)
         self.tasksFrame.columnconfigure(1, weight=0)
 
@@ -181,9 +215,65 @@ class TaskTimerApp:
             command=self.endDay,
             height=1
         )
-        self.endDayButton.grid(row=4, column=0, columnspan=2, padx=12, pady=(4, 12), sticky="we")
+        self.endDayButton.grid(row=5, column=0, columnspan=2, padx=12, pady=(4, 12), sticky="we")
 
         self.root.columnconfigure(0, weight=1)
+
+    def showToast(self, message, timeout=3000, error=False):
+        if self.toastTimer is not None:
+            self.root.after_cancel(self.toastTimer)
+            self.toastTimer = None
+        
+        if self.toastWindow is not None:
+            try:
+                self.toastWindow.destroy()
+            except:
+                pass
+            self.toastWindow = None
+        
+        self.toastWindow = tk.Toplevel(self.root)
+        self.toastWindow.configure(bg=self.bgColor)
+        self.toastWindow.attributes('-alpha', 0.9)
+        self.toastWindow.attributes('-topmost', True)
+        self.toastWindow.overrideredirect(True)
+        
+        bgColor = "#8b3333" if error else "#2a2f37"
+        
+        toastLabel = tk.Label(
+            self.toastWindow,
+            text=message,
+            font=("Segoe UI", 10),
+            fg="#ffffff",
+            bg=bgColor,
+            anchor="center",
+            padx=20,
+            pady=10
+        )
+        toastLabel.pack()
+        
+        self.root.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        
+        self.toastWindow.update_idletasks()
+        tw = self.toastWindow.winfo_width()
+        
+        x = rx + (rw - tw) // 2
+        y = ry + 20
+        
+        self.toastWindow.geometry(f"+{x}+{y}")
+        
+        def dismissToast():
+            try:
+                if self.toastWindow is not None:
+                    self.toastWindow.destroy()
+                    self.toastWindow = None
+            except:
+                pass
+            self.toastTimer = None
+        
+        self.toastTimer = self.root.after(timeout, dismissToast)
 
     def onEntryReturn(self, event):
         self.addTask()
@@ -241,14 +331,10 @@ class TaskTimerApp:
             self.history = {}
 
     def saveData(self):
-        # Replace task/group section in file with current desired state (removes deleted tasks/groups).
         self.sync_task_group_section()
         return
 
     def sync_task_group_section(self):
-        """Rewrite the file so the beginning contains current task records (in order),
-           then current group records, then preserve all existing history records.
-        """
         desired_tasks = list(self.rows.keys())
         desired_groups = dict(self.groups or {})
 
@@ -258,7 +344,6 @@ class TaskTimerApp:
         except Exception:
             pass
 
-        # If file doesn't exist create it with tasks -> groups (no history yet).
         if not os.path.exists(self.realPath):
             try:
                 with open(self.realPath, "w", encoding="utf-8") as f:
@@ -273,36 +358,34 @@ class TaskTimerApp:
 
         tmp = None
         try:
-            # collect history objects and any non-JSON (trimmed) lines to preserve
             preserved_history = []
+            preserved_chargeCodes = []
             preserved_other = []
             with open(self.realPath, "r", encoding="utf-8") as rf:
                 for raw in rf:
                     line = raw.rstrip("\n")
                     if not line.strip():
-                        # skip blank lines to keep file compact
                         continue
                     try:
                         obj = json.loads(line)
                     except Exception:
-                        # preserve non-JSON lines trimmed
                         preserved_other.append(line.strip())
                         continue
                     t = obj.get("type")
                     if t == "history":
                         preserved_history.append(obj)
+                    elif t == "chargeCode":
+                        preserved_chargeCodes.append(obj)
                     else:
-                        # skip task/group lines
                         continue
 
             tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, dir=dirpath)
-            # write fresh task lines
             for name in desired_tasks:
                 tmp.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False, separators=(',',':')) + "\n")
-            # write fresh group lines
             for t, g in desired_groups.items():
                 tmp.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False, separators=(',',':')) + "\n")
-            # append preserved history / other lines compactly
+            for obj in preserved_chargeCodes:
+                tmp.write(json.dumps(obj, ensure_ascii=False, separators=(',',':')) + "\n")
             for obj in preserved_history:
                 tmp.write(json.dumps(obj, ensure_ascii=False, separators=(',',':')) + "\n")
             for l in preserved_other:
@@ -323,10 +406,6 @@ class TaskTimerApp:
             return
 
     def append_history_entry(self, dateKey, entry):
-        """Write the given history record, replacing any existing record for the same date.
-           Streaming rewrite: copy file to a temp file skipping any existing history for dateKey,
-           then append the new history record. If file missing create it with current tasks/groups then the history.
-        """
         dirpath = os.path.dirname(self.realPath) or "."
         try:
             os.makedirs(dirpath, exist_ok=True)
@@ -359,6 +438,7 @@ class TaskTimerApp:
         tmp = None
         try:
             preserved_history = []
+            preserved_chargeCodes = []
             preserved_other = []
             with open(self.realPath, "r", encoding="utf-8") as rf:
                 for raw in rf:
@@ -376,17 +456,21 @@ class TaskTimerApp:
                         continue
                     if obj.get("type") == "history":
                         preserved_history.append(obj)
+                    elif obj.get("type") == "chargeCode":
+                        preserved_chargeCodes.append(obj)
                     else:
                         # skip other JSON (task/group) lines
                         continue
 
             tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, dir=dirpath)
-            # write preserved content first (we keep existing tasks/groups at top by rewriting them below)
             # write current tasks/groups fresh
             for name in list(self.rows.keys()):
                 tmp.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False, separators=(',',':')) + "\n")
             for t, g in (self.groups or {}).items():
                 tmp.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False, separators=(',',':')) + "\n")
+            # write preserved chargeCode lines
+            for obj in preserved_chargeCodes:
+                tmp.write(json.dumps(obj, ensure_ascii=False, separators=(',',':')) + "\n")
             # Append preserved history entries
             for obj in preserved_history:
                 tmp.write(json.dumps(obj, ensure_ascii=False, separators=(',',':')) + "\n")
@@ -553,23 +637,38 @@ class TaskTimerApp:
         def fmtIso(dtObj):
             return dtObj.strftime("%Y-%m-%dT%H:%M:%S")
 
+        def parseHHMM(s, fallbackHour, fallbackMinute):
+            try:
+                parts = (s or "").split(":")
+                if len(parts) != 2:
+                    return fallbackHour, fallbackMinute
+                return int(parts[0]), int(parts[1])
+            except Exception:
+                return fallbackHour, fallbackMinute
+
         first = timeline[0]
         last = timeline[-1]
 
         firstStart = parseIso(first.get("start"))
-        if firstStart is not None:
-            if firstStart.minute <= 5:
-                firstStart = firstStart.replace(minute=0, second=0, microsecond=0)
-                first["start"] = fmtIso(firstStart)
-
         lastEnd = parseIso(last.get("end"))
-        if lastEnd is not None:
-            if lastEnd.minute >= 55:
-                lastEnd = (lastEnd.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-                last["end"] = fmtIso(lastEnd)
+
+        if firstStart is None or lastEnd is None:
+            return timeline
+
+        workStartHour, workStartMinute = parseHHMM(self.workDayStart, 9, 0)
+        workEndHour, workEndMinute = parseHHMM(self.workDayEnd, 17, 0)
+
+        day = firstStart.date()
+        workStart = datetime(day.year, day.month, day.day, workStartHour, workStartMinute, 0)
+        workEnd = datetime(day.year, day.month, day.day, workEndHour, workEndMinute, 0)
+        
+        if abs((firstStart - workStart).total_seconds()) <= 5 * 60:
+            first["start"] = fmtIso(workStart)
+
+        if abs((lastEnd - workEnd).total_seconds()) <= 5 * 60:
+            last["end"] = fmtIso(workEnd)
 
         return timeline
-    
 
     def _closeActiveSegment(self, now=None):
         if now is None:
@@ -578,6 +677,392 @@ class TaskTimerApp:
             self._recordSegment(self.currentTask, self.currentStart, now)
         elif self.unassignedStart is not None:
             self._recordSegment("Untasked", self.unassignedStart, now)
+
+    def initializePunchSession(self):
+        try:
+            self.punchSession = posting.newSession()
+            posting.primeCookies(self.punchSession)
+            
+            _, loginJson = posting.login(self.punchSession)
+            
+            self.employeeId = posting.extractEmployeeId(loginJson)
+            
+            posting.saveCookies(self.punchSession)
+            
+            timesheetData = posting.copyPreviousTimesheet(self.punchSession, date.today().isoformat())
+            self.timesheetId = timesheetData["timesheetId"]
+        except Exception as e:
+            self.punchSession = None
+            self.employeeId = None
+            self.timesheetId = None
+
+    def punchIn(self):
+        if not self.useTimesheetFunctions:
+            return
+
+        def _punchInThread():
+            try:
+                if self.punchSession is None or self.employeeId is None:
+                    self.initializePunchSession()
+
+                if self.punchSession is None or self.employeeId is None:
+                    return
+
+                punchDt = datetime.now()
+                if self.roundToHours:
+                    try:
+                        h, m = (self.workDayStart).split(":")
+                        workStartDt = punchDt.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+                        if abs((punchDt - workStartDt).total_seconds()) <= 5 * 60:
+                            punchDt = workStartDt
+                    except Exception:
+                        pass
+                punchPayload = {
+                    "id": "",
+                    "punchDate": punchDt.strftime("%m/%d/%Y %I:%M %p"),
+                    "type": "IN",
+                    "employeeId": self.employeeId,
+                    "timesheetPage": True,
+                    "location": None,
+                    "new": True
+                }
+                posting.postPunch(self.punchSession, punchPayload)
+                self.showToast("Successfully clocked in!")
+            except Exception as e:
+                self.showToast(f"✗ Clock in failed: {e}", error=True)
+
+        threading.Thread(target=_punchInThread, daemon=True).start()
+
+    def punchOut(self):
+        if not self.useTimesheetFunctions:
+            return
+        
+        if self.punchSession is None or self.employeeId is None:
+            return
+        
+        def _punchOutThread():
+            try:
+                punchDt = datetime.now()
+                if self.roundToHours:
+                    try:
+                        h, m = (self.workDayEnd).split(":")
+                        workEndDt = punchDt.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+                        if abs((punchDt - workEndDt).total_seconds()) <= 5 * 60:
+                            punchDt = workEndDt
+                    except Exception:
+                        pass
+                punchPayload = {
+                    "id": "",
+                    "punchDate": punchDt.strftime("%m/%d/%Y %I:%M %p"),
+                    "type": "OUT",
+                    "employeeId": self.employeeId,
+                    "revisionNumber": -1,
+                    "chargeCodes": [],
+                    "payType": None,
+                    "noteModel": None,
+                    "billable": False,
+                    "date": None,
+                    "timesheetPage": True,
+                    "location": None,
+                    "new": True
+                }
+                posting.postPunch(self.punchSession, punchPayload)
+                self.showToast("Successfully clocked out!")
+            except Exception as e:
+                self.showToast(f"✗ Clock out failed: {e}", error=True)
+        
+        thread = threading.Thread(target=_punchOutThread, daemon=True)
+        thread.start()
+
+    def postChargeCodeHours(self, taskSecondsSnapshot=None):
+        if not self.autoChargeCodes:
+            return
+
+        def job():
+            try:
+                if self.punchSession is None or self.employeeId is None:
+                    self.initializePunchSession()
+
+                if self.punchSession is None or self.employeeId is None:
+                    self.showToast("Session not ready", error=True)
+                    return
+
+                chargeCodesByKey = self.loadChargeCodesFromJsonl()
+                if not chargeCodesByKey:
+                    self.showToast("No charge codes found", error=True)
+                    return
+
+                dateStr = date.today().strftime("%m/%d/%Y")
+
+                if isinstance(taskSecondsSnapshot, dict):
+                    taskSeconds = dict(taskSecondsSnapshot)
+                else:
+                    taskSeconds = dict(self.tasks)
+                    if self.currentTask and self.currentStart:
+                        now = time.time()
+                        taskSeconds[self.currentTask] = (
+                            taskSeconds.get(self.currentTask, 0.0) + (now - self.currentStart)
+                        )
+
+                hoursByKey = {key: 0.0 for key in chargeCodesByKey.keys()}
+
+                for taskName, seconds in taskSeconds.items():
+                    hours = round((seconds / 3600.0), 1)
+
+                    if taskName in chargeCodesByKey:
+                        hoursByKey[taskName] += hours
+                    else:
+                        groupName = self.groups.get(taskName)
+                        if groupName in chargeCodesByKey:
+                            hoursByKey[groupName] += hours
+
+                hadError = False
+                for key, hours in hoursByKey.items():
+                    try:
+                        posting.postHoursWorked(
+                            self.punchSession,
+                            self.employeeId,
+                            self.timesheetId,
+                            chargeCodesByKey[key],
+                            dateStr,
+                            hours
+                        )
+                    except Exception:
+                        hadError = True
+
+                if hadError:
+                    self.showToast("Posted charge codes (some failed)", error=True)
+                else:
+                    self.showToast("Successfully posted charge codes")
+
+            except Exception:
+                self.showToast("Error posting charge codes", error=True)
+
+        threading.Thread(target=job, daemon=True).start()
+
+
+    def createDragGhost(self, name):
+        if name not in self.rows:
+            return
+        rowFrame, nameLabel, timeLabel, deleteBtn = self.rows[name]
+
+        self.root.update_idletasks()
+        h = rowFrame.winfo_height() or self.rowHeight
+        w = self.tasksFrame.winfo_width() - 4
+        y = rowFrame.winfo_y()
+
+        ghost = tk.Frame(self.tasksFrame, bg=self.cardColor, bd=2, relief="ridge")
+        ghost.place(x=0, y=y, width=w, height=h)
+
+        label = tk.Label(
+            ghost,
+            text=name,
+            font=("Segoe UI", 11, "bold"),
+            bg=self.cardColor,
+            fg=self.textColor,
+            anchor="w"
+        )
+        label.pack(fill="both", padx=10, pady=8)
+
+        self.dragGhost = ghost
+
+    def startDrag(self, name, event):
+        self.dragTaskName = name
+        names = list(self.rows.keys())
+        try:
+            idx = names.index(name)
+        except ValueError:
+            self.dragFromIndex = None
+            self.dragCurrentIndex = None
+            return
+        self.dragFromIndex = idx
+        self.dragCurrentIndex = idx
+        self.dragStartY = event.y_root
+
+        self.createDragGhost(name)
+        self.refreshRowStyles()
+
+    def onDrag(self, event):
+        if self.dragTaskName is None or self.dragFromIndex is None:
+            return
+        if self.dragGhost is None:
+            return
+
+        tasksTop = self.tasksFrame.winfo_rooty()
+        tasksHeight = self.tasksFrame.winfo_height()
+        yInside = event.y_root - tasksTop
+
+        self.dragGhost.update_idletasks()
+        gh = self.dragGhost.winfo_height() or self.rowHeight
+        newY = max(0, min(yInside - gh / 2, tasksHeight - gh))
+        self.dragGhost.place_configure(y=newY)
+
+        names = list(self.rows.keys())
+        if not names:
+            return
+
+        targetIndex = len(names) - 1
+        for i, n in enumerate(names):
+            rowFrame, _, _, _ = self.rows[n]
+            top = rowFrame.winfo_rooty()
+            bottom = top + rowFrame.winfo_height()
+            mid = (top + bottom) / 2
+            if event.y_root < mid:
+                targetIndex = i
+                break
+
+        try:
+            oldPos = names.index(self.dragTaskName)
+        except ValueError:
+            return
+
+        if targetIndex == oldPos:
+            return
+
+        names.pop(oldPos)
+        names.insert(targetIndex, self.dragTaskName)
+
+        newRows = {}
+        for n in names:
+            newRows[n] = self.rows[n]
+        self.rows = newRows
+
+        self.dragCurrentIndex = targetIndex
+        self.relayoutRows()
+
+    def onClose(self):
+        now = time.time()
+
+        self._closeActiveSegment(now)
+
+        if self.currentTask is not None and self.currentStart is not None:
+            elapsed = now - self.currentStart
+            self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
+            self.currentTask = None
+            self.currentStart = None
+            self.refreshRowStyles()
+
+        self.stopUnassigned(now)
+
+        if self.hasUnsavedTime:
+            lines = []
+            totalHours = 0.0
+
+            for name, seconds in self.tasks.items():
+                hours = seconds / 3600.0
+                totalHours += hours
+                lines.append(f"{name}: {hours} h")
+
+            if self.unassignedSeconds > 0:
+                unHours = self.unassignedSeconds / 3600.0
+                totalHours += unHours
+                lines.append(f"Untasked: {unHours} h")
+
+            lines.append(f"Total: {totalHours} h")
+            summary = "\n".join(lines)
+
+            todayKey = date.today().isoformat()
+            merged, choice = self._mergeSummaryForDate(todayKey, summary, allowSkip=True)
+
+            if merged is None or choice == "cancel":
+                return
+
+            if merged == "__SKIP__" or choice == "skip":
+                self.hasUnsavedTime = False
+                self.dayTimeline = []
+                self.root.destroy()
+                return
+
+            existingEntry = self.history.get(todayKey)
+            existingTimeline = []
+            if isinstance(existingEntry, dict):
+                existingTimeline = existingEntry.get("timeline", []) or []
+
+            if choice == "append":
+                timeline = existingTimeline + list(self.dayTimeline)
+            else:
+                timeline = list(self.dayTimeline)
+
+            timeline = self._roundTimelineEdgesToHour(timeline)
+
+            self.history[todayKey] = {
+                "summary": merged,
+                "timeline": timeline
+            }
+            # append only the day's summary to the jsonl log
+            self.append_history_entry(todayKey, self.history[todayKey])
+
+            taskSecondsSnapshot = dict(self.tasks)
+            if self.currentTask and self.currentStart:
+                now2 = time.time()
+                taskSecondsSnapshot[self.currentTask] = (
+                    taskSecondsSnapshot.get(self.currentTask, 0.0) + (now2 - self.currentStart)
+                )
+
+            if choice == "append" and existingEntry:
+                if isinstance(existingEntry, dict):
+                    existingText = existingEntry.get("summary", "") or ""
+                else:
+                    existingText = existingEntry or ""
+                oldAgg, _ = self._parseSummaryText(existingText)
+                for name, hours in oldAgg.items():
+                    taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
+
+            self.postChargeCodeHours(taskSecondsSnapshot)
+            
+            # Punch out when closing with unsaved time
+            self.punchOut()
+            
+            self.hasUnsavedTime = False
+            self.dayTimeline = []
+
+        self.root.destroy()
+
+    def endDrag(self, event):
+        if self.dragGhost is not None:
+            self.dragGhost.destroy()
+            self.dragGhost = None
+
+        if self.dragTaskName is None:
+            return
+        self.dragTaskName = None
+        self.dragFromIndex = None
+        self.dragCurrentIndex = None
+        self.dragStartY = 0
+        self.refreshRowStyles()
+        self.saveData()
+    
+    def openSettings(self):
+        return openSettingsImpl(self)
+
+    def openHistory(self):
+        return openHistoryImpl(self)
+
+    def clearDayData(self):
+        if not messagebox.askyesno("Clear Day", "Clear all times and timeline for today? This cannot be undone."):
+            return
+        
+        now = time.time()
+        
+        if self.currentTask is not None and self.currentStart is not None:
+            self.currentTask = None
+            self.currentStart = None
+        
+        self.unassignedStart = None
+        self.unassignedSeconds = 0.0
+        
+        for name in self.tasks.keys():
+            self.tasks[name] = 0.0
+        
+        self.dayTimeline = []
+        
+        todayKey = date.today().isoformat()
+        if todayKey in self.history:
+            del self.history[todayKey]
+        
+        self.hasUnsavedTime = False
+        self.refreshRowStyles()
+        messagebox.showinfo("Cleared", "All times and timeline have been cleared.")
 
     def startTask(self, name):
         now = time.time()
@@ -611,6 +1096,10 @@ class TaskTimerApp:
         self.currentStart = now
         self.hasUnsavedTime = True
         self.refreshRowStyles()
+        
+        shouldPunchIn = not any(self.tasks.values()) and self.unassignedSeconds == 0
+        if shouldPunchIn:
+            self.root.after(200, self.punchIn)
 
     def refreshRowStyles(self):
         for name, (rowFrame, nameLabel, timeLabel, deleteBtn) in self.rows.items():
@@ -901,10 +1390,8 @@ class TaskTimerApp:
             existingTimeline = existingEntry.get("timeline", []) or []
 
         if choice == "append":
-            # keep any existing timeline entries and append today's segments
             timeline = existingTimeline + list(self.dayTimeline)
         else:
-            # overwrite semantics: replace timeline with today's segments
             timeline = list(self.dayTimeline)
 
         timeline = self._roundTimelineEdgesToHour(timeline)
@@ -913,191 +1400,56 @@ class TaskTimerApp:
             "summary": merged,
             "timeline": timeline
         }
-        # append only the day's summary to the jsonl log
         self.append_history_entry(todayKey, self.history[todayKey])
-        self.dayTimeline = []
+        
+        taskSecondsSnapshot = dict(self.tasks)
+        if choice == "append" and existingEntry:
+            if isinstance(existingEntry, dict):
+                existingText = existingEntry.get("summary", "") or ""
+            else:
+                existingText = existingEntry or ""
+            oldAgg, _ = self._parseSummaryText(existingText)
+            for name, hours in oldAgg.items():
+                taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
+        self.postChargeCodeHours(taskSecondsSnapshot)
 
-        # TODO: settings for if you want this copied to your clipboard
-        #self.root.clipboard_clear()
-        #self.root.clipboard_append(merged)
+        self.punchOut()
+        
+        # CLEAR session data after saving TODO: should this be a setting?
+        self.dayTimeline = []
+        self.tasks = {name: 0.0 for name in self.tasks.keys()}
+        self.unassignedSeconds = 0.0
+        self.unassignedStart = None
+        self.currentTask = None
+        self.currentStart = None
+        self.hasUnsavedTime = False
+        self.refreshRowStyles()
+
         messagebox.showinfo("Summary: ", merged)
 
-        self.hasUnsavedTime = False
-
-    def createDragGhost(self, name):
-        if name not in self.rows:
-            return
-        rowFrame, nameLabel, timeLabel, deleteBtn = self.rows[name]
-
-        self.root.update_idletasks()
-        h = rowFrame.winfo_height() or self.rowHeight
-        w = self.tasksFrame.winfo_width() - 4
-        y = rowFrame.winfo_y()
-
-        ghost = tk.Frame(self.tasksFrame, bg=self.cardColor, bd=2, relief="ridge")
-        ghost.place(x=0, y=y, width=w, height=h)
-
-        label = tk.Label(
-            ghost,
-            text=name,
-            font=("Segoe UI", 11, "bold"),
-            bg=self.cardColor,
-            fg=self.textColor,
-            anchor="w"
-        )
-        label.pack(fill="both", padx=10, pady=8)
-
-        self.dragGhost = ghost
-
-    def startDrag(self, name, event):
-        self.dragTaskName = name
-        names = list(self.rows.keys())
+    def loadChargeCodesFromJsonl(self):
+        chargeCodesByKey = {}
         try:
-            idx = names.index(name)
-        except ValueError:
-            self.dragFromIndex = None
-            self.dragCurrentIndex = None
-            return
-        self.dragFromIndex = idx
-        self.dragCurrentIndex = idx
-        self.dragStartY = event.y_root
-
-        self.createDragGhost(name)
-        self.refreshRowStyles()
-
-    def onDrag(self, event):
-        if self.dragTaskName is None or self.dragFromIndex is None:
-            return
-        if self.dragGhost is None:
-            return
-
-        tasksTop = self.tasksFrame.winfo_rooty()
-        tasksHeight = self.tasksFrame.winfo_height()
-        yInside = event.y_root - tasksTop
-
-        self.dragGhost.update_idletasks()
-        gh = self.dragGhost.winfo_height() or self.rowHeight
-        newY = max(0, min(yInside - gh / 2, tasksHeight - gh))
-        self.dragGhost.place_configure(y=newY)
-
-        names = list(self.rows.keys())
-        if not names:
-            return
-
-        targetIndex = len(names) - 1
-        for i, n in enumerate(names):
-            rowFrame, _, _, _ = self.rows[n]
-            top = rowFrame.winfo_rooty()
-            bottom = top + rowFrame.winfo_height()
-            mid = (top + bottom) / 2
-            if event.y_root < mid:
-                targetIndex = i
-                break
-
-        try:
-            oldPos = names.index(self.dragTaskName)
-        except ValueError:
-            return
-
-        if targetIndex == oldPos:
-            return
-
-        names.pop(oldPos)
-        names.insert(targetIndex, self.dragTaskName)
-
-        newRows = {}
-        for n in names:
-            newRows[n] = self.rows[n]
-        self.rows = newRows
-
-        self.dragCurrentIndex = targetIndex
-        self.relayoutRows()
-
-    def onClose(self):
-        now = time.time()
-
-        self._closeActiveSegment(now)
-
-        if self.currentTask is not None and self.currentStart is not None:
-            elapsed = now - self.currentStart
-            self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
-            self.currentTask = None
-            self.currentStart = None
-            self.refreshRowStyles()
-
-        self.stopUnassigned(now)
-
-        if self.hasUnsavedTime:
-            lines = []
-            totalHours = 0.0
-
-            for name, seconds in self.tasks.items():
-                hours = seconds / 3600.0
-                totalHours += hours
-                lines.append(f"{name}: {hours} h")
-
-            if self.unassignedSeconds > 0:
-                unHours = self.unassignedSeconds / 3600.0
-                totalHours += unHours
-                lines.append(f"Untasked: {unHours} h")
-
-            lines.append(f"Total: {totalHours} h")
-            summary = "\n".join(lines)
-
-            todayKey = date.today().isoformat()
-            merged, choice = self._mergeSummaryForDate(todayKey, summary, allowSkip=True)
-
-            if merged is None or choice == "cancel":
-                return
-
-            if merged == "__SKIP__" or choice == "skip":
-                self.hasUnsavedTime = False
-                self.dayTimeline = []
-                self.root.destroy()
-                return
-
-            existingEntry = self.history.get(todayKey)
-            existingTimeline = []
-            if isinstance(existingEntry, dict):
-                existingTimeline = existingEntry.get("timeline", []) or []
-
-            if choice == "append":
-                timeline = existingTimeline + list(self.dayTimeline)
-            else:
-                timeline = list(self.dayTimeline)
-
-            timeline = self._roundTimelineEdgesToHour(timeline)
-
-            self.history[todayKey] = {
-                "summary": merged,
-                "timeline": timeline
-            }
-            # append only the day's summary to the jsonl log
-            self.append_history_entry(todayKey, self.history[todayKey])
-            self.hasUnsavedTime = False
-            self.dayTimeline = []
-
-        self.root.destroy()
-
-    def endDrag(self, event):
-        if self.dragGhost is not None:
-            self.dragGhost.destroy()
-            self.dragGhost = None
-
-        if self.dragTaskName is None:
-            return
-        self.dragTaskName = None
-        self.dragFromIndex = None
-        self.dragCurrentIndex = None
-        self.dragStartY = 0
-        self.refreshRowStyles()
-        self.saveData()
-    
-    def openSettings(self):
-        return openSettingsImpl(self)
-
-    def openHistory(self):
-        return openHistoryImpl(self)
+            with open(self.dataFile, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("//"):
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    
+                    if obj.get("type") == "chargeCode":
+                        groupKey = obj.get("groupKey", "").strip()
+                        chargeCodes = obj.get("chargeCodes", [])
+                        
+                        if groupKey and chargeCodes:
+                            chargeCodesByKey[groupKey] = chargeCodes
+        except Exception as e:
+            pass
+        
+        return chargeCodesByKey
 
 if __name__ == "__main__":
     root = tk.Tk()
