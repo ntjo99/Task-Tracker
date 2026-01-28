@@ -169,33 +169,24 @@ def login(s: requests.Session) -> Tuple[requests.Response, Dict[str, Any]]:
     })
 
     payload = {"email": email, "password": password}
+    
     r = s.post(baseUrl + loginPath, json=payload, allow_redirects=False, timeout=30)
-
-    # print("=== LOGIN RESPONSE ===")
-    # print("status:", r.status_code)
-    if (r.status_code == 200):
-        print("Login Success")
-
-    # print("\n-- headers --")
-    # for k, v in r.headers.items():
-    #     print(f"{k}: {v}")
-
-    # print("\n-- body --")
-    # print(r.text)
-
-    # print("\n-- cookies after login --")
-    # for c in s.cookies:
-    #     print(f"{c.name}={c.value}; domain={c.domain}; path={c.path}")
-
-    # print("=======================")
-
-    r.raise_for_status()
 
     data: Dict[str, Any]
     try:
         data = r.json()
     except Exception as e:
         raise RuntimeError(f"Login did not return JSON: {e}") from e
+
+    # Check for authentication success in response data
+    if data.get("authenticated") is False:
+        errorMsg = data.get("error", "Unknown authentication error")
+        raise RuntimeError(f"Login failed: {errorMsg}")
+    
+    if not data or data.get("id") is None:
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(f"Login error: {data.get('error')}")
+        raise RuntimeError("Login failed: No employee ID in response")
 
     return r, data
 

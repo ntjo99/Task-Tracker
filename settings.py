@@ -2,6 +2,12 @@ import tkinter as tk
 import json
 import os
 import re
+import sys
+
+def resourcePath(relPath):
+	if hasattr(sys, "_MEIPASS"):
+		return os.path.join(sys._MEIPASS, relPath)
+	return relPath
 
 DEFAULT_SETTINGS = {
     "workDayStart": "09:00",
@@ -128,6 +134,7 @@ def openSettings(app):
     win.grab_set()
     win.lift()
     win.focus_force()
+    win.iconbitmap(resourcePath("hourglass.ico"))
 
     w = 1000
     h = 550

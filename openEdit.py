@@ -1,5 +1,11 @@
 import tkinter as tk
-from datetime import datetime, time as dtime
+from datetime import datetime, date, time as dtime
+import sys
+
+def resourcePath(relPath):
+	if hasattr(sys, "_MEIPASS"):
+		return os.path.join(sys._MEIPASS, relPath)
+	return relPath
 
 def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary, refreshDays, showDaySummary, ppColorMap, updatePeriods, tasks):
     """
@@ -34,6 +40,8 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
     editor.geometry(f"{dw}x{dh}+{x}+{y}")
 
     editor.grab_set()
+
+    editor.iconbitmap(resourcePath("hourglass.ico"))
 
     editor.columnconfigure(0, weight=0)
     editor.columnconfigure(1, weight=1)
@@ -727,6 +735,20 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
             self.append_history_entry(dayKey, self.history[dayKey])
         except Exception:
             pass
+        # post charge codes for edits only when editing within the most recent (non-ended) pay period
+        try:
+            if getattr(self, "autoChargeCodes", False) and getattr(self, "useTimesheetFunctions", False):
+                mostRecent = periods[0] if periods else None
+                mostRecentDays = (mostRecent or {}).get("days") if isinstance(mostRecent, dict) else None
+
+                if isinstance(mostRecentDays, list) and dayKey in mostRecentDays and mostRecentDays:
+                    endKey = max(str(d) for d in mostRecentDays if d)
+                    if endKey >= date.today().isoformat():
+                        taskSecondsSnapshot = dict(per_task_seconds)
+                        self.postChargeCodeHours(taskSecondsSnapshot, dateKey=dayKey)
+        except Exception:
+            pass
+
         # update pay-period aggregates before refreshing UI
         try:
             updatePeriods()

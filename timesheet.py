@@ -30,6 +30,7 @@ class TaskTimerApp:
         self.useTimesheetFunctions = self.settings.get("useTimesheetFunctions", True)
         self.autoChargeCodes = self.settings.get("autoChargeCodes", True)
 
+
         self.bgColor = "#111315"
         self.cardColor = "#1e2227"
         self.accentColor = "#3f8cff"
@@ -251,7 +252,7 @@ class TaskTimerApp:
             pady=10
         )
         toastLabel.pack()
-
+        
         self.root.update_idletasks()
         rx = self.root.winfo_rootx()
         ry = self.root.winfo_rooty()
@@ -259,12 +260,12 @@ class TaskTimerApp:
         
         self.toastWindow.update_idletasks()
         tw = self.toastWindow.winfo_width()
-
+        
         x = rx + (rw - tw) // 2
         y = ry + 20
-
+        
         self.toastWindow.geometry(f"+{x}+{y}")
-
+        
         def dismissToast():
             try:
                 if self.toastWindow is not None:
@@ -662,7 +663,7 @@ class TaskTimerApp:
         day = firstStart.date()
         workStart = datetime(day.year, day.month, day.day, workStartHour, workStartMinute, 0)
         workEnd = datetime(day.year, day.month, day.day, workEndHour, workEndMinute, 0)
-
+        
         if abs((firstStart - workStart).total_seconds()) <= 5 * 60:
             first["start"] = fmtIso(workStart)
 
@@ -683,13 +684,13 @@ class TaskTimerApp:
         try:
             self.punchSession = posting.newSession()
             posting.primeCookies(self.punchSession)
-    
+            
             _, loginJson = posting.login(self.punchSession)
-    
+            
             self.employeeId = posting.extractEmployeeId(loginJson)
-    
+            
             posting.saveCookies(self.punchSession)
-    
+            
             timesheetData = posting.copyPreviousTimesheet(self.punchSession, date.today().isoformat())
             self.timesheetId = timesheetData["timesheetId"]
         except Exception as e:
@@ -704,8 +705,7 @@ class TaskTimerApp:
 
         def _punchInThread():
             try:
-                if self.punchSession is None or self.employeeId is None:
-                    self.initializePunchSession()
+                self.initializePunchSession()
 
                 if self.punchSession is None or self.employeeId is None:
                     return
@@ -738,12 +738,13 @@ class TaskTimerApp:
     def punchOut(self):
         if not self.useTimesheetFunctions:
             return
-
-        if self.punchSession is None or self.employeeId is None:
-            return
-
+        
         def _punchOutThread():
             try:
+                self.initializePunchSession()
+
+                if self.punchSession is None or self.employeeId is None:
+                    return
                 punchDt = datetime.now()
                 if self.roundToHours:
                     try:
@@ -769,14 +770,16 @@ class TaskTimerApp:
                     "new": True
                 }
                 posting.postPunch(self.punchSession, punchPayload)
-                self.showToast("Successfully clocked out!")
+                self._punchOutSuccess = True
+                
             except Exception as e:
-                self.showToast(f"✗ Clock out failed: {e}", error=True)
-
+                self._punchOutSuccess = False
+        
         thread = threading.Thread(target=_punchOutThread, daemon=True)
         thread.start()
+        return thread
 
-    def postChargeCodeHours(self, taskSecondsSnapshot=None):
+    def postChargeCodeHours(self, taskSecondsSnapshot=None, dateKey=None):
         if not self.autoChargeCodes:
             return
 
@@ -794,7 +797,13 @@ class TaskTimerApp:
                     self.showToast("No charge codes found", error=True)
                     return
 
-                dateStr = date.today().strftime("%m/%d/%Y")
+                if dateKey:
+                    try:
+                        dateStr = datetime.strptime(dateKey, "%Y-%m-%d").strftime("%m/%d/%Y")
+                    except Exception:
+                        dateStr = date.today().strftime("%m/%d/%Y")
+                else:
+                    dateStr = date.today().strftime("%m/%d/%Y")
 
                 if isinstance(taskSecondsSnapshot, dict):
                     taskSeconds = dict(taskSecondsSnapshot)
@@ -804,6 +813,10 @@ class TaskTimerApp:
                         now = time.time()
                         taskSeconds[self.currentTask] = (
                             taskSeconds.get(self.currentTask, 0.0) + (now - self.currentStart)
+                        )
+                    if self.unassignedSeconds > 0:
+                        taskSeconds["Untasked"] = (
+                            taskSeconds.get("Untasked", 0.0) + self.unassignedSeconds
                         )
 
                 hoursByKey = {key: 0.0 for key in chargeCodesByKey.keys()}
@@ -1008,11 +1021,17 @@ class TaskTimerApp:
                 oldAgg, _ = self._parseSummaryText(existingText)
                 for name, hours in oldAgg.items():
                     taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
-
-            self.postChargeCodeHours(taskSecondsSnapshot)
-
+            
             # Punch out when closing with unsaved time
-            self.punchOut()
+            punchThread = self.punchOut()
+            if punchThread:
+                punchThread.join()
+            if self._punchOutSuccess:
+                self.showToast("Successfully clocked out!")
+            else:
+                self.showToast(f"✗ Clock out failed!", error=True)
+            self.postChargeCodeHours(taskSecondsSnapshot)
+            
             self.hasUnsavedTime = False
             self.dayTimeline = []
 
@@ -1031,7 +1050,7 @@ class TaskTimerApp:
         self.dragStartY = 0
         self.refreshRowStyles()
         self.saveData()
-
+    
     def openSettings(self):
         return openSettingsImpl(self)
 
@@ -1041,25 +1060,25 @@ class TaskTimerApp:
     def clearDayData(self):
         if not messagebox.askyesno("Clear Day", "Clear all times and timeline for today? This cannot be undone."):
             return
-
+        
         now = time.time()
-
+        
         if self.currentTask is not None and self.currentStart is not None:
             self.currentTask = None
             self.currentStart = None
-
+        
         self.unassignedStart = None
         self.unassignedSeconds = 0.0
-
+        
         for name in self.tasks.keys():
             self.tasks[name] = 0.0
-
+        
         self.dayTimeline = []
-
+        
         todayKey = date.today().isoformat()
         if todayKey in self.history:
             del self.history[todayKey]
-
+        
         self.hasUnsavedTime = False
         self.refreshRowStyles()
         messagebox.showinfo("Cleared", "All times and timeline have been cleared.")
@@ -1411,9 +1430,11 @@ class TaskTimerApp:
             oldAgg, _ = self._parseSummaryText(existingText)
             for name, hours in oldAgg.items():
                 taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
-        self.postChargeCodeHours(taskSecondsSnapshot)
 
-        self.punchOut()
+        punchThread = self.punchOut()
+        if punchThread:
+            punchThread.join()
+        self.postChargeCodeHours(taskSecondsSnapshot)
         
         # CLEAR session data after saving TODO: should this be a setting?
         self.dayTimeline = []
