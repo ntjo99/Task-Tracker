@@ -1,4 +1,5 @@
 import os
+import sys
 from http.cookiejar import MozillaCookieJar
 from typing import Any, Dict, Optional, Tuple
 from datetime import date, datetime
@@ -158,6 +159,8 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
 
 
 def loadEnv(path="posting.env"):
+    if not os.path.exists(path):
+        return
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -166,10 +169,20 @@ def loadEnv(path="posting.env"):
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-loadEnv()
-baseUrl = os.environ["BASE_URL"]
-email = os.environ["EMAIL"]
-password = os.environ["PASSWORD"]
+if getattr(sys, "frozen", False):
+    _baseDir = os.path.dirname(sys.executable)
+else:
+    _baseDir = os.path.dirname(os.path.abspath(__file__))
+
+_envPath = os.path.join(_baseDir, "posting.env")
+
+try:
+    loadEnv(_envPath)
+except FileNotFoundError:
+    pass
+baseUrl = os.getenv("BASE_URL", "").strip()
+email = os.getenv("EMAIL", "").strip()
+password = os.getenv("PASSWORD", "")
 primePath = "/"
 loginPath = "/login"
 punchesPath = "/punches"

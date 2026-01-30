@@ -543,16 +543,6 @@ def openSettings(app):
 
                 todayIso = date.today().isoformat()
                 ts = posting.copyPreviousTimesheet(s, todayIso)
-                print("=== RAW copyPreviousTimesheet response ===")
-                print(ts)
-
-                print("=== RAW chargeCodeIDModels ===")
-                models = ts.get("chargeCodeIDModels")
-                if not models:
-                    print("NO chargeCodeIDModels PRESENT")
-                else:
-                    for i, m in enumerate(models):
-                        print(f"[{i}] {m}  type={type(m)}")
                 models = ts.get("chargeCodeIDModels") or []
                 if not models:
                     raise RuntimeError("No charge codes returned from copyPreviousTimesheet")
