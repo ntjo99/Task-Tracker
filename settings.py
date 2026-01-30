@@ -1,8 +1,12 @@
 import tkinter as tk
+from tkinter import messagebox
 import json
 import os
 import re
 import sys
+import threading
+from datetime import date
+import posting
 
 def resourcePath(relPath):
 	if hasattr(sys, "_MEIPASS"):
@@ -296,6 +300,79 @@ def openSettings(app):
 
     row += 1
 
+    baseUrlLabel = tk.Label(
+        generalFrame,
+        text="Base URL:",
+        font=("Segoe UI", 9),
+        fg=app.textColor,
+        bg=app.cardColor,
+        anchor="w"
+    )
+    baseUrlLabel.grid(row=row, column=0, sticky="w", padx=12, pady=6)
+
+    baseUrlVar = tk.StringVar(value="")
+    baseUrlEntry = tk.Entry(
+        generalFrame,
+        textvariable=baseUrlVar,
+        font=("Segoe UI", 9),
+        bg="#2c313a",
+        fg=app.textColor,
+        insertbackground=app.textColor,
+        relief="flat"
+    )
+    baseUrlEntry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+
+    row += 1
+
+    emailLabel = tk.Label(
+        generalFrame,
+        text="Email:",
+        font=("Segoe UI", 9),
+        fg=app.textColor,
+        bg=app.cardColor,
+        anchor="w"
+    )
+    emailLabel.grid(row=row, column=0, sticky="w", padx=12, pady=6)
+
+    emailVar = tk.StringVar(value="")
+    emailEntry = tk.Entry(
+        generalFrame,
+        textvariable=emailVar,
+        font=("Segoe UI", 9),
+        bg="#2c313a",
+        fg=app.textColor,
+        insertbackground=app.textColor,
+        relief="flat"
+    )
+    emailEntry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+
+    row += 1
+
+    passwordLabel = tk.Label(
+        generalFrame,
+        text="Password:",
+        font=("Segoe UI", 9),
+        fg=app.textColor,
+        bg=app.cardColor,
+        anchor="w"
+    )
+    passwordLabel.grid(row=row, column=0, sticky="w", padx=12, pady=6)
+
+    passwordVar = tk.StringVar(value="")
+    passwordEntry = tk.Entry(
+        generalFrame,
+        textvariable=passwordVar,
+        font=("Segoe UI", 9),
+        bg="#2c313a",
+        fg=app.textColor,
+        insertbackground=app.textColor,
+        relief="flat",
+        show="*"
+    )
+    passwordEntry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+
+    row += 1
+
     roundToHoursVar = tk.IntVar(value=1 if settings.get("roundToHours", False) else 0)
     roundCb = tk.Checkbutton(
         generalFrame,
@@ -375,22 +452,56 @@ def openSettings(app):
     ungroupedTasks = sorted([t for t in app.rows.keys() if t not in app.groups]) if hasattr(app, "rows") else []
     taskGroupOptions = ["<None>"] + allGroups + ungroupedTasks
 
-    # Collect all charge code chunks
-    chargeCodeChunks = loadChargeCodesFromJsonl(dataFile)
+    chargeCodeVars = {}
+    chargeCodeChunks = []
 
-    # Build table with one row per chunk
-    if chargeCodeChunks:
+    def readGroupKeyForChunk(chunkIdx):
+        try:
+            with open(dataFile, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if obj.get("type") == "chargeCode" and obj.get("chunkIndex") == chunkIdx:
+                        return (obj.get("groupKey") or "").strip()
+        except Exception:
+            return ""
+        return ""
+
+    def rebuildChargeCodeTable():
+        nonlocal chargeCodeChunks, chargeCodeVars
+
+        for child in tableFrame.winfo_children():
+            child.destroy()
+
         chargeCodeVars = {}
-        
+        chargeCodeChunks = loadChargeCodesFromJsonl(dataFile)
+
+        if not chargeCodeChunks:
+            noCodesLabel = tk.Label(
+                tableFrame,
+                text="No charge codes found in data file",
+                font=("Segoe UI", 9),
+                fg="#999999",
+                bg=app.cardColor
+            )
+            noCodesLabel.pack(padx=12, pady=12)
+
+            tableFrame.update_idletasks()
+            scrollCanvas.config(scrollregion=scrollCanvas.bbox("all"))
+            return
+
         for chunkIdx, chunkCodes in enumerate(chargeCodeChunks):
-            # Create a frame for this row
             rowFrame = tk.Frame(tableFrame, bg=app.cardColor)
             rowFrame.grid(row=chunkIdx, column=0, columnspan=2, sticky="ew", padx=0, pady=6)
             rowFrame.columnconfigure(0, weight=1)
             rowFrame.columnconfigure(1, weight=0)
-            
-            # Left side: display all code names
-            codeNamesText = " | ".join([code.get("chargeCodeName", "") for code in chunkCodes])
+
+            codeNamesText = " | ".join([str(c.get("chargeCodeName") or "") for c in chunkCodes])            
             codesLabel = tk.Label(
                 rowFrame,
                 text=codeNamesText,
@@ -401,36 +512,11 @@ def openSettings(app):
                 wraplength=300
             )
             codesLabel.grid(row=0, column=0, sticky="w", padx=12, pady=6)
-            
-            # Determine current group for this chunk by looking at groupKey
-            currentGroup = ""
-            groupKey = ""
-            # We need to find the original groupKey - scan the file
-            try:
-                with open(dataFile, "r", encoding="utf-8") as f:
-                    for line in f:
-                        if not line.strip():
-                            continue
-                        try:
-                            obj = json.loads(line.strip())
-                            if obj.get("type") == "chargeCode" and obj.get("chunkIndex") == chunkIdx:
-                                groupKey = obj.get("groupKey", "")
-                                break
-                        except:
-                            pass
-            except:
-                pass
-            
-            if groupKey:
-                currentGroup = groupKey
-            
-            # Right side: single dropdown for the chunk
+
+            currentGroup = readGroupKeyForChunk(chunkIdx)
+
             chunkVar = tk.StringVar(value=currentGroup)
-            chargeDrop = tk.OptionMenu(
-                rowFrame,
-                chunkVar,
-                *taskGroupOptions
-            )
+            chargeDrop = tk.OptionMenu(rowFrame, chunkVar, *taskGroupOptions)
             chargeDrop.grid(row=0, column=1, sticky="ew", padx=12, pady=6)
             chargeDrop.config(
                 bg="#2c313a",
@@ -442,21 +528,66 @@ def openSettings(app):
                 relief="solid",
                 width=20
             )
-            
-            # Store the var for this chunk
+
             chargeCodeVars[chunkIdx] = chunkVar
 
         tableFrame.update_idletasks()
         scrollCanvas.config(scrollregion=scrollCanvas.bbox("all"))
-    else:
-        noCodesLabel = tk.Label(
-            tableFrame,
-            text="No charge codes found in data file",
-            font=("Segoe UI", 9),
-            fg="#999999",
-            bg=app.cardColor
-        )
-        noCodesLabel.pack(padx=12, pady=12)
+
+    def pullAndRefreshChargeCodes():
+        def job():
+            try:
+                s = posting.newSession()
+                posting.primeCookies(s)
+                posting.login(s)
+
+                todayIso = date.today().isoformat()
+                ts = posting.copyPreviousTimesheet(s, todayIso)
+                print("=== RAW copyPreviousTimesheet response ===")
+                print(ts)
+
+                print("=== RAW chargeCodeIDModels ===")
+                models = ts.get("chargeCodeIDModels")
+                if not models:
+                    print("NO chargeCodeIDModels PRESENT")
+                else:
+                    for i, m in enumerate(models):
+                        print(f"[{i}] {m}  type={type(m)}")
+                models = ts.get("chargeCodeIDModels") or []
+                if not models:
+                    raise RuntimeError("No charge codes returned from copyPreviousTimesheet")
+
+                posting.insertChargeCodesBetweenGroupAndHistory(dataFile, models)
+
+                win.after(0, rebuildChargeCodeTable)
+
+                if hasattr(app, "showToast"):
+                    app.showToast("Charge codes refreshed")
+
+
+            except Exception as e:
+                if hasattr(app, "showToast"):
+                    win.after(0, lambda: app.showToast(f"Charge code refresh failed: {e}", timeout=6000, error=True))
+                else:
+                    win.after(0, lambda: messagebox.showerror("Charge code refresh failed", str(e)))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    rebuildChargeCodeTable()
+
+    refreshBtn = tk.Button(
+        chargeFrame,
+        text="Pull Previous Timesheet Charge Codes",
+        font=("Segoe UI", 9, "bold"),
+        bg="#1b1f24",
+        fg=app.textColor,
+        activebackground="#2c3440",
+        activeforeground=app.textColor,
+        relief="flat",
+        command=pullAndRefreshChargeCodes
+    )
+    refreshBtn.grid(row=2, column=0, sticky="w", padx=12, pady=(6, 12))
+
 
     btnFrame = tk.Frame(win, bg=app.bgColor)
     btnFrame.pack(fill="x", padx=14, pady=(0, 12))
@@ -500,6 +631,16 @@ def openSettings(app):
         # Write charge code mappings to JSONL
         updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars)
 
+        baseUrlVal = baseUrlVar.get().strip()
+        emailVal = emailVar.get().strip()
+        passwordVal = passwordVar.get().strip()
+        
+        if baseUrlVal or emailVal or passwordVal:
+            updatePostingEnv(app.getBaseDir(), baseUrlVal, emailVal, passwordVal)
+            # Reload posting module to get updated env vars
+            import importlib
+            importlib.reload(posting)
+
         app.settings = settings
         app.minSegmentSeconds = int(m * 60)
         app.workDayStart = start
@@ -542,66 +683,87 @@ def openSettings(app):
     workStartEntry.focus_set()
 
 def updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars):
-    """Update the JSONL file with charge code groupKey assignments"""
     if not os.path.exists(dataFile):
         return
-    
+
+    tmpPath = dataFile + ".tmp"
+
     try:
-        # Read all lines, preserving non-chargeCode entries
-        lines = []
-        with open(dataFile, "r", encoding="utf-8") as f:
-            for raw in f:
+        ccIdx = 0
+
+        with open(dataFile, "r", encoding="utf-8") as src, open(tmpPath, "w", encoding="utf-8") as dst:
+            for raw in src:
                 line = raw.strip()
                 if not line or line.startswith("//"):
+                    dst.write(raw)
                     continue
+
                 try:
                     obj = json.loads(line)
                 except Exception:
-                    lines.append(raw.rstrip("\n"))
+                    dst.write(raw)
                     continue
-                
+
                 if obj.get("type") != "chargeCode":
-                    lines.append(raw.rstrip("\n"))
-                # skip chargeCode lines, we'll rebuild them below
-        
-        # Rebuild chargeCode lines with updated groupKey
-        newLines = []
-        for line in lines:
-            newLines.append(line)
-        
-        # Add updated chargeCode entries
-        for chunkIdx, chunk in enumerate(chargeCodeChunks):
-            groupKey = chargeCodeVars.get(chunkIdx, tk.StringVar()).get().strip()
-            
-            if not groupKey or groupKey == "<None>":
-                groupKey = ""
-            
-            # Rebuild the chargeCodes array
-            codesToWrite = []
-            for code in chunk:
-                codesToWrite.append({
-                    "chargeCodeId": code.get("chargeCodeId"),
-                    "chargeCodeName": code.get("chargeCodeName"),
-                    "type": code.get("type"),
-                    "hierarchicalName": code.get("hierarchicalName", ""),
-                    "children": code.get("children", False),
-                    "leave": code.get("leave", False)
-                })
-            
-            chargeCodeObj = {
-                "type": "chargeCode",
-                "groupKey": groupKey,
-                "chunkIndex": chunkIdx,
-                "chargeCodes": codesToWrite
-            }
-            newLines.append(json.dumps(chargeCodeObj, ensure_ascii=False, separators=(',', ':')))
-        
-        # Write back to file
-        with open(dataFile, "w", encoding="utf-8") as f:
-            for line in newLines:
-                f.write(line + "\n")
-    
+                    dst.write(raw)
+                    continue
+
+                groupKey = chargeCodeVars.get(ccIdx, tk.StringVar()).get().strip()
+                if not groupKey or groupKey == "<None>":
+                    groupKey = ""
+
+                obj["groupKey"] = groupKey
+
+                dst.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+                ccIdx += 1
+
+        os.replace(tmpPath, dataFile)
+
     except Exception as e:
+        try:
+            if os.path.exists(tmpPath):
+                os.remove(tmpPath)
+        except Exception:
+            pass
         print(f"Error updating charge codes in JSONL: {e}")
         import traceback
         traceback.print_exc()
+
+def updatePostingEnv(baseDir, baseUrl="", email="", password=""):
+    """Update posting.env with provided credentials, keeping existing values if not provided"""
+    envPath = os.path.join(baseDir, "posting.env")
+    
+    # Load existing values
+    existing = {"BASE_URL": "", "EMAIL": "", "PASSWORD": ""}
+    if os.path.exists(envPath):
+        try:
+            with open(envPath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, val = line.split("=", 1)
+                        key = key.strip()
+                        val = val.strip()
+                        if key in existing:
+                            existing[key] = val
+        except Exception:
+            pass
+    
+    # Update with provided values (only if non-empty)
+    if baseUrl:
+        existing["BASE_URL"] = baseUrl
+    if email:
+        existing["EMAIL"] = email
+    if password:
+        existing["PASSWORD"] = password
+    
+    # Write back to file
+    try:
+        with open(envPath, "w", encoding="utf-8") as f:
+            f.write(f"BASE_URL={existing['BASE_URL']}\n")
+            f.write(f"EMAIL={existing['EMAIL']}\n")
+            f.write(f"PASSWORD={existing['PASSWORD']}\n")
+    except Exception:
+        pass

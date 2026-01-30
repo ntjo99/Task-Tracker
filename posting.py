@@ -10,7 +10,25 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
 
     def chunk4(arr):
         for i in range(0, len(arr), 4):
-            yield i // 4, arr[i:i+4]
+            yield arr[i:i + 4]
+
+    def normalizeModel(m):
+        if not isinstance(m, dict):
+            return None
+
+        ccId = m.get("chargeCodeId") or m.get("chargeCodeID") or m.get("chargeCodeId".upper())
+        name = m.get("chargeCodeName")
+        typ = m.get("type")
+        hier = m.get("hierarchicalName")
+        leave = m.get("leave")
+
+        return {
+            "chargeCodeId": ccId,
+            "chargeCodeName": name,
+            "type": typ,
+            "hierarchicalName": hier,
+            "leave": bool(leave) if leave is not None else False,
+        }
 
     def chunkSignature(chunk):
         ids = []
@@ -22,6 +40,9 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
         while len(ids) < 4:
             ids.append(None)
         return tuple(ids[:4])
+
+    def isAllNullIds(sig):
+        return all(x is None for x in sig)
 
     def existingSignatureFromChargeCodeRecord(rec):
         chunk = rec.get("chargeCodes")
@@ -38,20 +59,54 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
         }
         return json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n"
 
+    normalized = []
+    for m in (chargeCodeIdModels or []):
+        nm = normalizeModel(m)
+        if nm is None:
+            nm = {
+                "chargeCodeId": None,
+                "chargeCodeName": None,
+                "type": None,
+                "hierarchicalName": None,
+                "leave": False,
+            }
+        normalized.append(nm)
+
+    if not normalized:
+        return
+
+    if (len(normalized) % 4) != 0:
+        pad = 4 - (len(normalized) % 4)
+        for _ in range(pad):
+            normalized.append({
+                "chargeCodeId": None,
+                "chargeCodeName": None,
+                "type": None,
+                "hierarchicalName": None,
+                "leave": False,
+            })
+
     with open(path, "r", encoding="utf-8") as src, open(tmpPath, "w", encoding="utf-8") as dst:
         inGroup = False
         groupKey = ""
         seenChargeCodeSigs = set()
         insertedSigs = set()
+        maxChunkIndex = -1
 
         def insertMissingChargeCodes():
-            nonlocal insertedSigs
-            for idx, chunk in chunk4(chargeCodeIdModels):
+            nonlocal insertedSigs, maxChunkIndex
+
+            nextChunkIndex = maxChunkIndex + 1
+            for chunk in chunk4(normalized):
                 sig = chunkSignature(chunk)
+                if isAllNullIds(sig):
+                    continue
                 if sig in seenChargeCodeSigs or sig in insertedSigs:
                     continue
-                dst.write(mkChargeCodeLine(groupKey, idx, chunk))
+
+                dst.write(mkChargeCodeLine(groupKey, nextChunkIndex, chunk))
                 insertedSigs.add(sig)
+                nextChunkIndex += 1
 
         for rawLine in src:
             stripped = rawLine.strip()
@@ -68,32 +123,39 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
             recType = rec.get("type")
 
             if recType == "group":
-                dst.write(rawLine)  # verbatim
+                dst.write(rawLine)
                 inGroup = True
                 insertedSigs = set()
                 seenChargeCodeSigs = set()
-                groupKey = rec.get("groupKey") or rec.get("key") or ""
+                maxChunkIndex = -1
+                groupKey = rec.get("groupKey") or rec.get("key") or rec.get("name") or ""
                 continue
 
             if inGroup and recType == "chargeCode":
+                try:
+                    ci = rec.get("chunkIndex")
+                    if ci is not None:
+                        maxChunkIndex = max(maxChunkIndex, int(ci))
+                except Exception:
+                    pass
+
                 sig = existingSignatureFromChargeCodeRecord(rec)
                 if sig is not None:
                     seenChargeCodeSigs.add(sig)
-                dst.write(rawLine)  # verbatim
+
+                dst.write(rawLine)
                 continue
 
             if inGroup and recType == "history":
                 insertMissingChargeCodes()
                 inGroup = False
-                dst.write(rawLine)  # verbatim
+                dst.write(rawLine)
                 continue
 
             dst.write(rawLine)
 
-        # If file ends while still "inGroup" (no history encountered), do nothing.
-        # This preserves your file unchanged unless we hit the group->history boundary.
-
     os.replace(tmpPath, path)
+
 
 def loadEnv(path="posting.env"):
     with open(path, "r", encoding="utf-8") as f:
