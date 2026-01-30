@@ -4,7 +4,12 @@ import time
 import os
 import sys
 import json
+import tempfile
+import threading
 from datetime import date, timedelta, datetime
+from openHistory import openHistory as openHistoryImpl
+from settings import openSettings as openSettingsImpl, loadSettings as loadSettingsImpl
+import posting
 
 def resourcePath(relPath):
 	if hasattr(sys, "_MEIPASS"):
@@ -17,14 +22,23 @@ class TaskTimerApp:
         self.root.title("Task Timer")
         self.root.iconbitmap(resourcePath("hourglass.ico"))
 
+        self.settings = loadSettingsImpl(os.path.join(self.getBaseDir(), "settings.json"))
+        self.minSegmentSeconds = self.settings["minRecordedMinutes"] * 60
+        self.workDayStart = self.settings["workDayStart"]
+        self.workDayEnd = self.settings["workDayEnd"]
+        self.roundToHours = self.settings["roundToHours"]
+        self.useTimesheetFunctions = self.settings.get("useTimesheetFunctions", True)
+        self.autoChargeCodes = self.settings.get("autoChargeCodes", True)
+
+
         self.bgColor = "#111315"
         self.cardColor = "#1e2227"
         self.accentColor = "#3f8cff"
         self.textColor = "#e5e5e5"
         self.activeColor = "#254a7a"
 
-        self.baseWidth = 400
-        self.baseHeight = 260
+        self.baseWidth = int(self.settings.get("mainWindowWidth", 400))
+        self.baseHeight = int(self.settings.get("mainWindowHeight", 400))
         self.rowHeight = 40
 
         self.root.configure(bg=self.bgColor)
@@ -48,14 +62,37 @@ class TaskTimerApp:
         self.unassignedStart = None
 
         self.hasUnsavedTime = False
+        self.punchSession = None
+        self.employeeId = None
+        self.timesheetId = None
 
-        self.dataFile = os.path.join(self.getBaseDir(), "tasks.json")
+        self.toastWindow = None
+        self.toastTimer = None
 
+        self.validateEnvFile()
+
+        baseDir = self.getBaseDir()
+        # always write to tasks.jsonl. For reading: prefer tasks.jsonl, otherwise fall back to tasks.example.jsonl.
+        self.realPath = os.path.join(baseDir, "tasks.jsonl")
+        self.examplePath = os.path.join(baseDir, "tasks.example.jsonl")
+
+        if os.path.exists(self.realPath):
+            # use the real file when present (never touch the example)
+            self.dataFile = self.realPath
+            self.using_example = False
+        elif os.path.exists(self.examplePath):
+            # no real file yet — read from example until the user makes a change
+            self.dataFile = self.examplePath
+            self.using_example = True
+        else:
+            # neither exists — default to real path (will be created on first save)
+            self.dataFile = self.realPath
+            self.using_example = False
         self.dayTimeline = []
-        self.minSegmentSeconds = 6 * 60
 
         self.buildUi()
         self.loadData()
+        self.restoreTodayTimeline()
         self.relayoutRows()
         self.updateLoop()
 
@@ -65,11 +102,22 @@ class TaskTimerApp:
     def getBaseDir(self):
         return os.path.dirname(os.path.abspath(sys.argv[0]))
 
+    def restoreTodayTimeline(self):
+        """Restore timeline from today's saved entry if it exists"""
+        todayKey = date.today().isoformat()
+        entry = self.history.get(todayKey)
+        if isinstance(entry, dict):
+            timeline = entry.get("timeline", []) or []
+            if timeline:
+                self.dayTimeline = [dict(seg) for seg in timeline]
+
     def buildUi(self):
         topBar = tk.Frame(self.root, bg=self.bgColor)
         topBar.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 4), sticky="we")
         topBar.columnconfigure(0, weight=1)
         topBar.columnconfigure(1, weight=0)
+        topBar.columnconfigure(2, weight=0)
+        topBar.columnconfigure(3, weight=0)
 
         title = tk.Label(
             topBar,
@@ -79,6 +127,32 @@ class TaskTimerApp:
             bg=self.bgColor
         )
         title.grid(row=0, column=0, sticky="w")
+
+        settingsBtn = tk.Button(
+            topBar,
+            text="⚙",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=self.openSettings
+        )
+        settingsBtn.grid(row=0, column=1, sticky="e", padx=(6, 0))
+
+        clearBtn = tk.Button(
+            topBar,
+            text="Clear",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=self.clearDayData
+        )
+        clearBtn.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
         historyBtn = tk.Button(
             topBar,
@@ -91,7 +165,7 @@ class TaskTimerApp:
             relief="flat",
             command=self.openHistory
         )
-        historyBtn.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        historyBtn.grid(row=0, column=3, sticky="e", padx=(8, 0))
 
         subtitle = tk.Label(
             self.root,
@@ -100,7 +174,7 @@ class TaskTimerApp:
             fg="#9099a6",
             bg=self.bgColor
         )
-        subtitle.grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
+        subtitle.grid(row=2, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
 
         self.newTaskEntry = tk.Entry(
             self.root,
@@ -110,7 +184,7 @@ class TaskTimerApp:
             insertbackground=self.textColor,
             relief="flat"
         )
-        self.newTaskEntry.grid(row=2, column=0, padx=(12, 6), pady=6, sticky="we")
+        self.newTaskEntry.grid(row=3, column=0, padx=(12, 6), pady=6, sticky="we")
         self.newTaskEntry.bind("<Return>", self.onEntryReturn)
 
         self.addTaskButton = tk.Button(
@@ -124,10 +198,10 @@ class TaskTimerApp:
             relief="flat",
             command=self.addTask
         )
-        self.addTaskButton.grid(row=2, column=1, padx=(6, 12), pady=6, sticky="we")
+        self.addTaskButton.grid(row=3, column=1, padx=(6, 12), pady=6, sticky="we")
 
         self.tasksFrame = tk.Frame(self.root, bg=self.bgColor)
-        self.tasksFrame.grid(row=3, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="nwe")
+        self.tasksFrame.grid(row=4, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="nwe")
         self.tasksFrame.columnconfigure(0, weight=1)
         self.tasksFrame.columnconfigure(1, weight=0)
 
@@ -143,9 +217,65 @@ class TaskTimerApp:
             command=self.endDay,
             height=1
         )
-        self.endDayButton.grid(row=4, column=0, columnspan=2, padx=12, pady=(4, 12), sticky="we")
+        self.endDayButton.grid(row=5, column=0, columnspan=2, padx=12, pady=(4, 12), sticky="we")
 
         self.root.columnconfigure(0, weight=1)
+
+    def showToast(self, message, timeout=3000, error=False):
+        if self.toastTimer is not None:
+            self.root.after_cancel(self.toastTimer)
+            self.toastTimer = None
+        
+        if self.toastWindow is not None:
+            try:
+                self.toastWindow.destroy()
+            except:
+                pass
+            self.toastWindow = None
+        
+        self.toastWindow = tk.Toplevel(self.root)
+        self.toastWindow.configure(bg=self.bgColor)
+        self.toastWindow.attributes('-alpha', 0.9)
+        self.toastWindow.attributes('-topmost', True)
+        self.toastWindow.overrideredirect(True)
+        
+        bgColor = "#8b3333" if error else "#2a2f37"
+        
+        toastLabel = tk.Label(
+            self.toastWindow,
+            text=message,
+            font=("Segoe UI", 10),
+            fg="#ffffff",
+            bg=bgColor,
+            anchor="center",
+            padx=20,
+            pady=10
+        )
+        toastLabel.pack()
+        
+        self.root.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        
+        self.toastWindow.update_idletasks()
+        tw = self.toastWindow.winfo_width()
+        
+        x = rx + (rw - tw) // 2
+        y = ry + 20
+        
+        self.toastWindow.geometry(f"+{x}+{y}")
+        
+        def dismissToast():
+            try:
+                if self.toastWindow is not None:
+                    self.toastWindow.destroy()
+                    self.toastWindow = None
+            except:
+                pass
+            self.toastTimer = None
+        
+        self.toastTimer = self.root.after(timeout, dismissToast)
 
     def onEntryReturn(self, event):
         self.addTask()
@@ -155,33 +285,219 @@ class TaskTimerApp:
         if not os.path.exists(self.dataFile):
             return
         try:
+            tasks_list = []
+            groups = {}
+            history = {}
             with open(self.dataFile, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for name in data.get("tasks", []):
+                is_jsonl = True
+                for raw in f:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        # not JSONL -> fallback to full JSON
+                        is_jsonl = False
+                        break
+                    t = obj.get("type")
+                    if t == "task":
+                        name = obj.get("name")
+                        if name:
+                            tasks_list.append(name)
+                    elif t == "group":
+                        task = obj.get("task")
+                        grp = obj.get("group")
+                        if task:
+                            groups[task] = grp
+                    elif t == "history":
+                        d = obj.get("date")
+                        if not d:
+                            continue
+                        entry = {}
+                        entry["summary"] = obj.get("summary", "") or ""
+                        entry["timeline"] = obj.get("timeline", []) or []
+                        history[d] = entry
+                if not is_jsonl:
+                    # fallback: parse entire file as legacy JSON
+                    f.seek(0)
+                    data = json.load(f)
+                    tasks_list = data.get("tasks", [])
+                    history = data.get("history", {}) or {}
+                    groups = data.get("groups", {}) or {}
+            for name in tasks_list:
                 self.createTaskRow(name)
-            self.history = data.get("history", {})
-            self.groups = data.get("groups", {}) or {}
+            self.history = history
+            self.groups = groups
         except Exception:
             self.history = {}
 
     def saveData(self):
-        names = list(self.rows.keys())
-        data = {
-            "tasks": names,
-            "history": self.history,
-            "groups": self.groups
-        }
+        self.sync_task_group_section()
+        return
+
+    def sync_task_group_section(self):
+        desired_tasks = list(self.rows.keys())
+        desired_groups = dict(self.groups or {})
+
+        dirpath = os.path.dirname(self.realPath) or "."
         try:
-            with open(self.dataFile, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.makedirs(dirpath, exist_ok=True)
         except Exception:
             pass
 
+        if not os.path.exists(self.realPath):
+            try:
+                with open(self.realPath, "w", encoding="utf-8") as f:
+                    for name in desired_tasks:
+                        f.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False, separators=(',',':')) + "\n")
+                    for t, g in desired_groups.items():
+                        f.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False, separators=(',',':')) + "\n")
+                self.dataFile = self.realPath
+            except Exception:
+                pass
+            return
+
+        tmp = None
+        try:
+            preserved_history = []
+            preserved_chargeCodes = []
+            preserved_other = []
+            with open(self.realPath, "r", encoding="utf-8") as rf:
+                for raw in rf:
+                    line = raw.rstrip("\n")
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        preserved_other.append(line.strip())
+                        continue
+                    t = obj.get("type")
+                    if t == "history":
+                        preserved_history.append(obj)
+                    elif t == "chargeCode":
+                        preserved_chargeCodes.append(obj)
+                    else:
+                        continue
+
+            tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, dir=dirpath)
+            for name in desired_tasks:
+                tmp.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False, separators=(',',':')) + "\n")
+            for t, g in desired_groups.items():
+                tmp.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False, separators=(',',':')) + "\n")
+            for obj in preserved_chargeCodes:
+                tmp.write(json.dumps(obj, ensure_ascii=False, separators=(',',':')) + "\n")
+            for obj in preserved_history:
+                tmp.write(json.dumps(obj, ensure_ascii=False, separators=(',',':')) + "\n")
+            for l in preserved_other:
+                tmp.write(l + "\n")
+
+            tmp.flush()
+            tmp.close()
+            os.replace(tmp.name, self.realPath)
+            self.dataFile = self.realPath
+        except Exception:
+            try:
+                if tmp is not None:
+                    tmp.close()
+                    if os.path.exists(tmp.name):
+                        os.remove(tmp.name)
+            except Exception:
+                pass
+            return
+
+    def append_history_entry(self, dateKey, entry):
+        dirpath = os.path.dirname(self.realPath) or "."
+        try:
+            os.makedirs(dirpath, exist_ok=True)
+        except Exception:
+            pass
+
+        if isinstance(entry, dict):
+            summary = entry.get("summary", "") or ""
+            timeline = entry.get("timeline", []) or []
+        else:
+            summary = entry or ""
+            timeline = []
+
+        new_obj = {"type": "history", "date": dateKey, "summary": summary, "timeline": timeline}
+
+        # If file doesn't exist, create and write tasks/groups then history.
+        if not os.path.exists(self.realPath):
+            try:
+                with open(self.realPath, "w", encoding="utf-8") as f:
+                    for name in list(self.rows.keys()):
+                        f.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False, separators=(',',':')) + "\n")
+                    for t, g in (self.groups or {}).items():
+                        f.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False, separators=(',',':')) + "\n")
+                    f.write(json.dumps(new_obj, ensure_ascii=False, separators=(',',':')) + "\n")
+                self.dataFile = self.realPath
+            except Exception:
+                pass
+            return
+
+        tmp = None
+        try:
+            preserved_history = []
+            preserved_chargeCodes = []
+            preserved_other = []
+            with open(self.realPath, "r", encoding="utf-8") as rf:
+                for raw in rf:
+                    line = raw.rstrip("\n")
+                    if not line.strip():
+                        # skip blank lines for compactness
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        preserved_other.append(line.strip())
+                        continue
+                    if obj.get("type") == "history" and obj.get("date") == dateKey:
+                        # skip existing history for this date (we will append the new one)
+                        continue
+                    if obj.get("type") == "history":
+                        preserved_history.append(obj)
+                    elif obj.get("type") == "chargeCode":
+                        preserved_chargeCodes.append(obj)
+                    else:
+                        # skip other JSON (task/group) lines
+                        continue
+
+            tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, dir=dirpath)
+            # write current tasks/groups fresh
+            for name in list(self.rows.keys()):
+                tmp.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False, separators=(',',':')) + "\n")
+            for t, g in (self.groups or {}).items():
+                tmp.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False, separators=(',',':')) + "\n")
+            # write preserved chargeCode lines
+            for obj in preserved_chargeCodes:
+                tmp.write(json.dumps(obj, ensure_ascii=False, separators=(',',':')) + "\n")
+            # Append preserved history entries
+            for obj in preserved_history:
+                tmp.write(json.dumps(obj, ensure_ascii=False, separators=(',',':')) + "\n")
+            # Append any non-JSON preserved lines trimmed
+            for l in preserved_other:
+                tmp.write(l + "\n")
+            # Append the new history record at the end.
+            tmp.write(json.dumps(new_obj, ensure_ascii=False, separators=(',',':')) + "\n")
+            tmp.flush()
+            tmp.close()
+            os.replace(tmp.name, self.realPath)
+            self.dataFile = self.realPath
+        except Exception:
+            try:
+                if tmp is not None:
+                    tmp.close()
+                    if os.path.exists(tmp.name):
+                        os.remove(tmp.name)
+            except Exception:
+                pass
+            return
+
     def adjustWindowHeight(self):
         self.root.update_idletasks()
-        width = self.root.winfo_width()
-        if width <= 0:
-            width = self.baseWidth
+        width = self.baseWidth
         count = len(self.rows)
         height = self.baseHeight + self.rowHeight * count + 20
         self.root.geometry(f"{width}x{height}")
@@ -310,6 +626,52 @@ class TaskTimerApp:
             "end": endIso
         })
 
+    def _roundTimelineEdgesToHour(self, timeline):
+        if not self.roundToHours or not timeline:
+            return timeline
+
+        def parseIso(s):
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
+
+        def fmtIso(dtObj):
+            return dtObj.strftime("%Y-%m-%dT%H:%M:%S")
+
+        def parseHHMM(s, fallbackHour, fallbackMinute):
+            try:
+                parts = (s or "").split(":")
+                if len(parts) != 2:
+                    return fallbackHour, fallbackMinute
+                return int(parts[0]), int(parts[1])
+            except Exception:
+                return fallbackHour, fallbackMinute
+
+        first = timeline[0]
+        last = timeline[-1]
+
+        firstStart = parseIso(first.get("start"))
+        lastEnd = parseIso(last.get("end"))
+
+        if firstStart is None or lastEnd is None:
+            return timeline
+
+        workStartHour, workStartMinute = parseHHMM(self.workDayStart, 9, 0)
+        workEndHour, workEndMinute = parseHHMM(self.workDayEnd, 17, 0)
+
+        day = firstStart.date()
+        workStart = datetime(day.year, day.month, day.day, workStartHour, workStartMinute, 0)
+        workEnd = datetime(day.year, day.month, day.day, workEndHour, workEndMinute, 0)
+        
+        if abs((firstStart - workStart).total_seconds()) <= 5 * 60:
+            first["start"] = fmtIso(workStart)
+
+        if abs((lastEnd - workEnd).total_seconds()) <= 5 * 60:
+            last["end"] = fmtIso(workEnd)
+
+        return timeline
+
     def _closeActiveSegment(self, now=None):
         if now is None:
             now = time.time()
@@ -317,6 +679,409 @@ class TaskTimerApp:
             self._recordSegment(self.currentTask, self.currentStart, now)
         elif self.unassignedStart is not None:
             self._recordSegment("Untasked", self.unassignedStart, now)
+
+    def initializePunchSession(self):
+        try:
+            self.punchSession = posting.newSession()
+            posting.primeCookies(self.punchSession)
+            
+            _, loginJson = posting.login(self.punchSession)
+            
+            self.employeeId = posting.extractEmployeeId(loginJson)
+            
+            posting.saveCookies(self.punchSession)
+            
+            timesheetData = posting.copyPreviousTimesheet(self.punchSession, date.today().isoformat())
+            self.timesheetId = timesheetData["timesheetId"]
+        except Exception as e:
+            self.showToast(f"Login error: {str(e)}", timeout=5000, error=True)
+            self.punchSession = None
+            self.employeeId = None
+            self.timesheetId = None
+
+    def punchIn(self):
+        if not self.useTimesheetFunctions:
+            return
+
+        def _punchInThread():
+            try:
+                self.initializePunchSession()
+
+                if self.punchSession is None or self.employeeId is None:
+                    return
+
+                punchDt = datetime.now()
+                if self.roundToHours:
+                    try:
+                        h, m = (self.workDayStart).split(":")
+                        workStartDt = punchDt.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+                        if abs((punchDt - workStartDt).total_seconds()) <= 5 * 60:
+                            punchDt = workStartDt
+                    except Exception:
+                        pass
+                punchPayload = {
+                    "id": "",
+                    "punchDate": punchDt.strftime("%m/%d/%Y %I:%M %p"),
+                    "type": "IN",
+                    "employeeId": self.employeeId,
+                    "timesheetPage": True,
+                    "location": None,
+                    "new": True
+                }
+                posting.postPunch(self.punchSession, punchPayload)
+                self.showToast("Successfully clocked in!")
+            except Exception as e:
+                self.showToast(f"✗ Clock in failed: {e}", error=True)
+
+        threading.Thread(target=_punchInThread, daemon=True).start()
+
+    def punchOut(self):
+        if not self.useTimesheetFunctions:
+            return
+        
+        def _punchOutThread():
+            try:
+                self.initializePunchSession()
+
+                if self.punchSession is None or self.employeeId is None:
+                    return
+                punchDt = datetime.now()
+                if self.roundToHours:
+                    try:
+                        h, m = (self.workDayEnd).split(":")
+                        workEndDt = punchDt.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+                        if abs((punchDt - workEndDt).total_seconds()) <= 5 * 60:
+                            punchDt = workEndDt
+                    except Exception:
+                        pass
+                punchPayload = {
+                    "id": "",
+                    "punchDate": punchDt.strftime("%m/%d/%Y %I:%M %p"),
+                    "type": "OUT",
+                    "employeeId": self.employeeId,
+                    "revisionNumber": -1,
+                    "chargeCodes": [],
+                    "payType": None,
+                    "noteModel": None,
+                    "billable": False,
+                    "date": None,
+                    "timesheetPage": True,
+                    "location": None,
+                    "new": True
+                }
+                posting.postPunch(self.punchSession, punchPayload)
+                self._punchOutSuccess = True
+                
+            except Exception as e:
+                self._punchOutSuccess = False
+        
+        thread = threading.Thread(target=_punchOutThread, daemon=True)
+        thread.start()
+        return thread
+
+    def postChargeCodeHours(self, taskSecondsSnapshot=None, dateKey=None):
+        if not self.autoChargeCodes:
+            return
+
+        def job():
+            try:
+                if self.punchSession is None or self.employeeId is None:
+                    self.initializePunchSession()
+
+                if self.punchSession is None or self.employeeId is None:
+                    self.showToast("Session not ready", error=True)
+                    return
+
+                chargeCodesByKey = self.loadChargeCodesFromJsonl()
+                if not chargeCodesByKey:
+                    self.showToast("No charge codes found", error=True)
+                    return
+
+                if dateKey:
+                    try:
+                        dateStr = datetime.strptime(dateKey, "%Y-%m-%d").strftime("%m/%d/%Y")
+                    except Exception:
+                        dateStr = date.today().strftime("%m/%d/%Y")
+                else:
+                    dateStr = date.today().strftime("%m/%d/%Y")
+
+                if isinstance(taskSecondsSnapshot, dict):
+                    taskSeconds = dict(taskSecondsSnapshot)
+                else:
+                    taskSeconds = dict(self.tasks)
+                    if self.currentTask and self.currentStart:
+                        now = time.time()
+                        taskSeconds[self.currentTask] = (
+                            taskSeconds.get(self.currentTask, 0.0) + (now - self.currentStart)
+                        )
+                    if self.unassignedSeconds > 0:
+                        taskSeconds["Untasked"] = (
+                            taskSeconds.get("Untasked", 0.0) + self.unassignedSeconds
+                        )
+
+                hoursByKey = {key: 0.0 for key in chargeCodesByKey.keys()}
+
+                for taskName, seconds in taskSeconds.items():
+                    hours = round((seconds / 3600.0), 1)
+
+                    if taskName in chargeCodesByKey:
+                        hoursByKey[taskName] += hours
+                    else:
+                        groupName = self.groups.get(taskName)
+                        if groupName in chargeCodesByKey:
+                            hoursByKey[groupName] += hours
+
+                hadError = False
+                for key, hours in hoursByKey.items():
+                    try:
+                        posting.postHoursWorked(
+                            self.punchSession,
+                            self.employeeId,
+                            self.timesheetId,
+                            chargeCodesByKey[key],
+                            dateStr,
+                            hours
+                        )
+                    except Exception:
+                        hadError = True
+
+                if hadError:
+                    self.showToast("Posted charge codes (some failed)", error=True)
+                else:
+                    self.showToast("Successfully posted charge codes")
+
+            except Exception:
+                self.showToast("Error posting charge codes", error=True)
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def createDragGhost(self, name):
+        if name not in self.rows:
+            return
+        rowFrame, nameLabel, timeLabel, deleteBtn = self.rows[name]
+
+        self.root.update_idletasks()
+        h = rowFrame.winfo_height() or self.rowHeight
+        w = self.tasksFrame.winfo_width() - 4
+        y = rowFrame.winfo_y()
+
+        ghost = tk.Frame(self.tasksFrame, bg=self.cardColor, bd=2, relief="ridge")
+        ghost.place(x=0, y=y, width=w, height=h)
+
+        label = tk.Label(
+            ghost,
+            text=name,
+            font=("Segoe UI", 11, "bold"),
+            bg=self.cardColor,
+            fg=self.textColor,
+            anchor="w"
+        )
+        label.pack(fill="both", padx=10, pady=8)
+
+        self.dragGhost = ghost
+
+    def startDrag(self, name, event):
+        self.dragTaskName = name
+        names = list(self.rows.keys())
+        try:
+            idx = names.index(name)
+        except ValueError:
+            self.dragFromIndex = None
+            self.dragCurrentIndex = None
+            return
+        self.dragFromIndex = idx
+        self.dragCurrentIndex = idx
+        self.dragStartY = event.y_root
+
+        self.createDragGhost(name)
+        self.refreshRowStyles()
+
+    def onDrag(self, event):
+        if self.dragTaskName is None or self.dragFromIndex is None:
+            return
+        if self.dragGhost is None:
+            return
+
+        tasksTop = self.tasksFrame.winfo_rooty()
+        tasksHeight = self.tasksFrame.winfo_height()
+        yInside = event.y_root - tasksTop
+
+        self.dragGhost.update_idletasks()
+        gh = self.dragGhost.winfo_height() or self.rowHeight
+        newY = max(0, min(yInside - gh / 2, tasksHeight - gh))
+        self.dragGhost.place_configure(y=newY)
+
+        names = list(self.rows.keys())
+        if not names:
+            return
+
+        targetIndex = len(names) - 1
+        for i, n in enumerate(names):
+            rowFrame, _, _, _ = self.rows[n]
+            top = rowFrame.winfo_rooty()
+            bottom = top + rowFrame.winfo_height()
+            mid = (top + bottom) / 2
+            if event.y_root < mid:
+                targetIndex = i
+                break
+
+        try:
+            oldPos = names.index(self.dragTaskName)
+        except ValueError:
+            return
+
+        if targetIndex == oldPos:
+            return
+
+        names.pop(oldPos)
+        names.insert(targetIndex, self.dragTaskName)
+
+        newRows = {}
+        for n in names:
+            newRows[n] = self.rows[n]
+        self.rows = newRows
+
+        self.dragCurrentIndex = targetIndex
+        self.relayoutRows()
+
+    def onClose(self):
+        now = time.time()
+
+        self._closeActiveSegment(now)
+
+        if self.currentTask is not None and self.currentStart is not None:
+            elapsed = now - self.currentStart
+            self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
+            self.currentTask = None
+            self.currentStart = None
+            self.refreshRowStyles()
+
+        self.stopUnassigned(now)
+
+        if self.hasUnsavedTime:
+            lines = []
+            totalHours = 0.0
+
+            for name, seconds in self.tasks.items():
+                hours = seconds / 3600.0
+                totalHours += hours
+                lines.append(f"{name}: {hours} h")
+
+            if self.unassignedSeconds > 0:
+                unHours = self.unassignedSeconds / 3600.0
+                totalHours += unHours
+                lines.append(f"Untasked: {unHours} h")
+
+            lines.append(f"Total: {totalHours} h")
+            summary = "\n".join(lines)
+
+            todayKey = date.today().isoformat()
+            merged, choice = self._mergeSummaryForDate(todayKey, summary, allowSkip=True)
+
+            if merged is None or choice == "cancel":
+                return
+
+            if merged == "__SKIP__" or choice == "skip":
+                self.hasUnsavedTime = False
+                self.dayTimeline = []
+                self.root.destroy()
+                return
+
+            existingEntry = self.history.get(todayKey)
+            existingTimeline = []
+            if isinstance(existingEntry, dict):
+                existingTimeline = existingEntry.get("timeline", []) or []
+
+            if choice == "append":
+                timeline = existingTimeline + list(self.dayTimeline)
+            else:
+                timeline = list(self.dayTimeline)
+
+            timeline = self._roundTimelineEdgesToHour(timeline)
+
+            self.history[todayKey] = {
+                "summary": merged,
+                "timeline": timeline
+            }
+            # append only the day's summary to the jsonl log
+            self.append_history_entry(todayKey, self.history[todayKey])
+
+            taskSecondsSnapshot = dict(self.tasks)
+            if self.currentTask and self.currentStart:
+                now2 = time.time()
+                taskSecondsSnapshot[self.currentTask] = (
+                    taskSecondsSnapshot.get(self.currentTask, 0.0) + (now2 - self.currentStart)
+                )
+
+            if choice == "append" and existingEntry:
+                if isinstance(existingEntry, dict):
+                    existingText = existingEntry.get("summary", "") or ""
+                else:
+                    existingText = existingEntry or ""
+                oldAgg, _ = self._parseSummaryText(existingText)
+                for name, hours in oldAgg.items():
+                    taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
+            
+            # Punch out when closing with unsaved time
+            punchThread = self.punchOut()
+            if punchThread:
+                punchThread.join()
+            if self._punchOutSuccess:
+                self.showToast("Successfully clocked out!")
+            else:
+                self.showToast(f"✗ Clock out failed!", error=True)
+            self.postChargeCodeHours(taskSecondsSnapshot)
+            
+            self.hasUnsavedTime = False
+            self.dayTimeline = []
+
+        self.root.destroy()
+
+    def endDrag(self, event):
+        if self.dragGhost is not None:
+            self.dragGhost.destroy()
+            self.dragGhost = None
+
+        if self.dragTaskName is None:
+            return
+        self.dragTaskName = None
+        self.dragFromIndex = None
+        self.dragCurrentIndex = None
+        self.dragStartY = 0
+        self.refreshRowStyles()
+        self.saveData()
+    
+    def openSettings(self):
+        return openSettingsImpl(self)
+
+    def openHistory(self):
+        return openHistoryImpl(self)
+
+    def clearDayData(self):
+        if not messagebox.askyesno("Clear Day", "Clear all times and timeline for today? This cannot be undone."):
+            return
+        
+        now = time.time()
+        
+        if self.currentTask is not None and self.currentStart is not None:
+            self.currentTask = None
+            self.currentStart = None
+        
+        self.unassignedStart = None
+        self.unassignedSeconds = 0.0
+        
+        for name in self.tasks.keys():
+            self.tasks[name] = 0.0
+        
+        self.dayTimeline = []
+        
+        todayKey = date.today().isoformat()
+        if todayKey in self.history:
+            del self.history[todayKey]
+        
+        self.hasUnsavedTime = False
+        self.refreshRowStyles()
+        messagebox.showinfo("Cleared", "All times and timeline have been cleared.")
 
     def startTask(self, name):
         now = time.time()
@@ -350,6 +1115,10 @@ class TaskTimerApp:
         self.currentStart = now
         self.hasUnsavedTime = True
         self.refreshRowStyles()
+        
+        shouldPunchIn = not any(self.tasks.values()) and self.unassignedSeconds == 0
+        if shouldPunchIn:
+            self.root.after(200, self.punchIn)
 
     def refreshRowStyles(self):
         for name, (rowFrame, nameLabel, timeLabel, deleteBtn) in self.rows.items():
@@ -639,1213 +1408,110 @@ class TaskTimerApp:
         if isinstance(existingEntry, dict):
             existingTimeline = existingEntry.get("timeline", []) or []
 
-        if choice == "append" and existingTimeline:
+        if choice == "append":
             timeline = existingTimeline + list(self.dayTimeline)
         else:
             timeline = list(self.dayTimeline)
+
+        timeline = self._roundTimelineEdgesToHour(timeline)
 
         self.history[todayKey] = {
             "summary": merged,
             "timeline": timeline
         }
-        self.saveData()
-        self.dayTimeline = []
-
-        # TODO: settings for if you want this copied to your clipboard
-        #self.root.clipboard_clear()
-        #self.root.clipboard_append(merged)
-        #messagebox.showinfo("Summary (copied to clipboard)", merged)
-
-        self.hasUnsavedTime = False
-
-    def createDragGhost(self, name):
-        if name not in self.rows:
-            return
-        rowFrame, nameLabel, timeLabel, deleteBtn = self.rows[name]
-
-        self.root.update_idletasks()
-        h = rowFrame.winfo_height() or self.rowHeight
-        w = self.tasksFrame.winfo_width() - 4
-        y = rowFrame.winfo_y()
-
-        ghost = tk.Frame(self.tasksFrame, bg=self.cardColor, bd=2, relief="ridge")
-        ghost.place(x=0, y=y, width=w, height=h)
-
-        label = tk.Label(
-            ghost,
-            text=name,
-            font=("Segoe UI", 11, "bold"),
-            bg=self.cardColor,
-            fg=self.textColor,
-            anchor="w"
-        )
-        label.pack(fill="both", padx=10, pady=8)
-
-        self.dragGhost = ghost
-
-    def startDrag(self, name, event):
-        self.dragTaskName = name
-        names = list(self.rows.keys())
-        try:
-            idx = names.index(name)
-        except ValueError:
-            self.dragFromIndex = None
-            self.dragCurrentIndex = None
-            return
-        self.dragFromIndex = idx
-        self.dragCurrentIndex = idx
-        self.dragStartY = event.y_root
-
-        self.createDragGhost(name)
-        self.refreshRowStyles()
-
-    def onDrag(self, event):
-        if self.dragTaskName is None or self.dragFromIndex is None:
-            return
-        if self.dragGhost is None:
-            return
-
-        tasksTop = self.tasksFrame.winfo_rooty()
-        tasksHeight = self.tasksFrame.winfo_height()
-        yInside = event.y_root - tasksTop
-
-        self.dragGhost.update_idletasks()
-        gh = self.dragGhost.winfo_height() or self.rowHeight
-        newY = max(0, min(yInside - gh / 2, tasksHeight - gh))
-        self.dragGhost.place_configure(y=newY)
-
-        names = list(self.rows.keys())
-        if not names:
-            return
-
-        targetIndex = len(names) - 1
-        for i, n in enumerate(names):
-            rowFrame, _, _, _ = self.rows[n]
-            top = rowFrame.winfo_rooty()
-            bottom = top + rowFrame.winfo_height()
-            mid = (top + bottom) / 2
-            if event.y_root < mid:
-                targetIndex = i
-                break
-
-        try:
-            oldPos = names.index(self.dragTaskName)
-        except ValueError:
-            return
-
-        if targetIndex == oldPos:
-            return
-
-        names.pop(oldPos)
-        names.insert(targetIndex, self.dragTaskName)
-
-        newRows = {}
-        for n in names:
-            newRows[n] = self.rows[n]
-        self.rows = newRows
-
-        self.dragCurrentIndex = targetIndex
-        self.relayoutRows()
-
-    def onClose(self):
-        now = time.time()
-
-        self._closeActiveSegment(now)
-
-        if self.currentTask is not None and self.currentStart is not None:
-            elapsed = now - self.currentStart
-            self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
-            self.currentTask = None
-            self.currentStart = None
-            self.refreshRowStyles()
-
-        self.stopUnassigned(now)
-
-        if self.hasUnsavedTime:
-            lines = []
-            totalHours = 0.0
-
-            for name, seconds in self.tasks.items():
-                hours = seconds / 3600.0
-                totalHours += hours
-                lines.append(f"{name}: {hours} h")
-
-            if self.unassignedSeconds > 0:
-                unHours = self.unassignedSeconds / 3600.0
-                totalHours += unHours
-                lines.append(f"Untasked: {unHours} h")
-
-            lines.append(f"Total: {totalHours} h")
-            summary = "\n".join(lines)
-
-            todayKey = date.today().isoformat()
-            merged, choice = self._mergeSummaryForDate(todayKey, summary, allowSkip=True)
-
-            if merged is None or choice == "cancel":
-                return
-
-            if merged == "__SKIP__" or choice == "skip":
-                self.hasUnsavedTime = False
-                self.dayTimeline = []
-                self.root.destroy()
-                return
-
-            existingEntry = self.history.get(todayKey)
-            existingTimeline = []
+        self.append_history_entry(todayKey, self.history[todayKey])
+        
+        taskSecondsSnapshot = dict(self.tasks)
+        if choice == "append" and existingEntry:
             if isinstance(existingEntry, dict):
-                existingTimeline = existingEntry.get("timeline", []) or []
-
-            if choice == "append" and existingTimeline:
-                timeline = existingTimeline + list(self.dayTimeline)
+                existingText = existingEntry.get("summary", "") or ""
             else:
-                timeline = list(self.dayTimeline)
+                existingText = existingEntry or ""
+            oldAgg, _ = self._parseSummaryText(existingText)
+            for name, hours in oldAgg.items():
+                taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
 
-            self.history[todayKey] = {
-                "summary": merged,
-                "timeline": timeline
-            }
-            self.saveData()
-            self.hasUnsavedTime = False
-            self.dayTimeline = []
-
-        self.root.destroy()
-
-    def endDrag(self, event):
-        if self.dragGhost is not None:
-            self.dragGhost.destroy()
-            self.dragGhost = None
-
-        if self.dragTaskName is None:
-            return
-        self.dragTaskName = None
-        self.dragFromIndex = None
-        self.dragCurrentIndex = None
-        self.dragStartY = 0
+        punchThread = self.punchOut()
+        if punchThread:
+            punchThread.join()
+        self.postChargeCodeHours(taskSecondsSnapshot)
+        
+        # CLEAR session data after saving TODO: should this be a setting?
+        self.dayTimeline = []
+        self.tasks = {name: 0.0 for name in self.tasks.keys()}
+        self.unassignedSeconds = 0.0
+        self.unassignedStart = None
+        self.currentTask = None
+        self.currentStart = None
+        self.hasUnsavedTime = False
         self.refreshRowStyles()
-        self.saveData()
 
-    def openHistory(self):
-        self.loadData()
-        if not self.history:
-            messagebox.showinfo("History", "No summaries saved yet.")
-            return
+        messagebox.showinfo("Summary: ", merged)
 
-        anchorStart = date(2025, 11, 29)
-        ppMap = {}
-
-        for dStr in self.history.keys():
-            try:
-                d = date.fromisoformat(dStr)
-            except ValueError:
-                continue
-            offset = (d - anchorStart).days
-            idx = offset // 14
-            ppStart = anchorStart + timedelta(days=idx * 14)
-            ppEnd = ppStart + timedelta(days=13)
-            key = (ppStart, ppEnd)
-            if key not in ppMap:
-                ppMap[key] = []
-            ppMap[key].append(dStr)
-
-        if not ppMap:
-            messagebox.showinfo("History", "No valid dated summaries.")
-            return
-
-        periods = []
-        for (start, end), days in ppMap.items():
-            daysSorted = sorted(days, reverse=True)
-            periods.append({
-                "start": start,
-                "end": end,
-                "days": daysSorted
-            })
-        periods.sort(key=lambda p: p["start"], reverse=True)
-
-        def _parseTimeToSeconds(ts): # Need this so that I don't get timezone confusion
-            try:
-                tpart = ts.split("T", 1)[1]
-            except IndexError:
-                return None, None, None, None
-
-            for sep in ("+", "-", "Z"):
-                idx = tpart.find(sep)
-                if idx > 0:
-                    tpart = tpart[:idx]
-                    break
-
-            comps = tpart.split(":")
-            if len(comps) < 2:
-                return None, None, None, None
-
-            h = int(comps[0])
-            m = int(comps[1])
-            s = int(comps[2]) if len(comps) > 2 else 0
-            total = h * 3600 + m * 60 + s
-            return h, m, s, total
-
-        def parseDaySummary(dayStr):
-            entry = self.history.get(dayStr, "")
-            if isinstance(entry, dict):
-                summary = entry.get("summary", "") or ""
-            else:
-                summary = entry or ""
-            agg = {}
-            total = 0.0
-            for line in summary.splitlines():
-                if ":" not in line:
-                    continue
-                name, rest = line.split(":", 1)
-                name = name.strip()
-                rest = rest.strip()
-                if not rest:
-                    continue
-                numToken = rest.split()[0]
-                try:
-                    hours = float(numToken)
-                except ValueError:
-                    continue
-                if name.lower() == "total":
-                    continue
-                agg[name] = agg.get(name, 0.0) + hours
-                total += hours
-            return agg, total
-
-        def collectAllTasks():
-            names = set()
-            for entry in self.history.values():
-                if isinstance(entry, dict):
-                    summary = entry.get("summary", "") or ""
-                else:
-                    summary = entry or ""
-                for line in summary.splitlines():
-                    if ":" not in line:
+    def loadChargeCodesFromJsonl(self):
+        chargeCodesByKey = {}
+        try:
+            with open(self.dataFile, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("//"):
                         continue
-                    name, _ = line.split(":", 1)
-                    name = name.strip()
-                    if not name or name.lower() == "total":
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
                         continue
-                    names.add(name)
-            return sorted(names)
+                    
+                    if obj.get("type") == "chargeCode":
+                        groupKey = obj.get("groupKey", "").strip()
+                        chargeCodes = obj.get("chargeCodes", [])
+                        
+                        if groupKey and chargeCodes:
+                            chargeCodesByKey[groupKey] = chargeCodes
+        except Exception as e:
+            pass
+        
+        return chargeCodesByKey
 
-        for p in periods:
-            agg = {}
-            total = 0.0
-            for dStr in p["days"]:
-                dayAgg, dayTotal = parseDaySummary(dStr)
-                for k, v in dayAgg.items():
-                    agg[k] = agg.get(k, 0.0) + v
-                total += dayTotal
-            p["agg"] = agg
-            p["total"] = total
-
-        histWin = tk.Toplevel(self.root)
-        histWin.title("History")
-        histWin.configure(bg=self.bgColor)
-        histWin.withdraw()
-
-        dw, dh = 900, 500
-
-        self.root.update_idletasks()
-        rx = self.root.winfo_rootx()
-        ry = self.root.winfo_rooty()
-        rw = self.root.winfo_width()
-        rh = self.root.winfo_height()
-
-        x = rx + (rw - dw) // 2
-        y = ry + (rh - dh) // 2
-        histWin.geometry(f"{dw}x{dh}+{x}+{y}")
-
-        histWin.deiconify()
-        histWin.transient(self.root)
-        histWin.lift()
-        histWin.focus_force()
-        histWin.attributes("-topmost", True)
-        histWin.after(100, lambda: histWin.attributes("-topmost", False))
-
-        histWin.columnconfigure(0, weight=0)
-        histWin.columnconfigure(1, weight=0)
-        histWin.columnconfigure(2, weight=1)
-        histWin.columnconfigure(3, weight=0)
-        histWin.rowconfigure(0, weight=1)
-        histWin.rowconfigure(1, weight=0)
-
-        ppFrame = tk.Frame(histWin, bg=self.bgColor)
-        ppFrame.grid(row=0, column=0, padx=8, pady=8, sticky="ns")
-        ppLabel = tk.Label(
-            ppFrame,
-            text="Pay Periods",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.textColor,
-            bg=self.bgColor
-        )
-        ppLabel.pack(anchor="w")
-
-        ppListbox = tk.Listbox(
-            ppFrame,
-            height=1,
-            width=20,
-            bg="#1b1f24",
-            fg=self.textColor,
-            selectbackground=self.accentColor,
-            selectforeground="#ffffff",
-            borderwidth=0,
-            highlightthickness=0,
-            font=("Segoe UI", 10)
-        )
-        ppListbox.pack(fill="both", expand=True, pady=(4, 0))
-
-        for p in periods:
-            start = p["start"]
-            end = p["end"]
-            label = f"{start.strftime('%b %d')} – {end.strftime('%b %d, %Y')}"
-            ppListbox.insert(tk.END, label)
-
-        dayFrame = tk.Frame(histWin, bg=self.bgColor)
-        dayFrame.grid(row=0, column=1, padx=8, pady=8, sticky="ns")
-        dayLabel = tk.Label(
-            dayFrame,
-            text="Days",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.textColor,
-            bg=self.bgColor
-        )
-        dayLabel.pack(anchor="w")
-
-        dayListbox = tk.Listbox(
-            dayFrame,
-            height=14,
-            width=14,
-            bg="#1b1f24",
-            fg=self.textColor,
-            selectbackground=self.accentColor,
-            selectforeground="#ffffff",
-            borderwidth=0,
-            highlightthickness=0,
-            font=("Segoe UI", 10)
-        )
-        dayListbox.pack(fill="both", expand=True, pady=(4, 0))
-
-        textFrame = tk.Frame(histWin, bg=self.bgColor)
-        textFrame.grid(row=0, column=2, padx=(0, 8), pady=8, sticky="nsew")
-        textFrame.rowconfigure(0, weight=0)
-        textFrame.rowconfigure(1, weight=1)
-        textFrame.rowconfigure(2, weight=0)
-        textFrame.rowconfigure(3, weight=1)
-        textFrame.columnconfigure(0, weight=2)
-        textFrame.columnconfigure(1, weight=1)
-
-        daySummaryLabel = tk.Label(
-            textFrame,
-            text="Daily Summary",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.textColor,
-            bg=self.bgColor
-        )
-        daySummaryLabel.grid(row=0, column=0, sticky="w")
-
-        timelineLabel = tk.Label(
-            textFrame,
-            text="Timeline",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.textColor,
-            bg=self.bgColor
-        )
-        timelineLabel.grid(row=0, column=1, sticky="w")
-
-        daySummaryBox = tk.Text(
-            textFrame,
-            bg="#1b1f24",
-            fg=self.textColor,
-            wrap="word",
-            borderwidth=0,
-            highlightthickness=0,
-            font=("Segoe UI", 10)
-        )
-        daySummaryBox.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
-
-        timelineCanvas = tk.Canvas(
-            textFrame,
-            bg="#1b1f24",
-            highlightthickness=0
-        )
-        timelineCanvas.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(4, 8))
-        rectTaskMap = {}
-        tooltip = {"win": None, "item": None}
-
-        ppSummaryLabel = tk.Label(
-            textFrame,
-            text="Pay Period Overview",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.textColor,
-            bg=self.bgColor
-        )
-        ppSummaryLabel.grid(row=2, column=0, columnspan=2, sticky="w")
-
-        ppSummaryBox = tk.Text(
-            textFrame,
-            bg="#1b1f24",
-            fg=self.textColor,
-            wrap="word",
-            borderwidth=0,
-            highlightthickness=0,
-            font=("Segoe UI", 10)
-        )
-        ppSummaryBox.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
-        ppPieCanvas = tk.Canvas(
-            textFrame,
-            bg="#1b1f24",
-            highlightthickness=0
-        )
-        ppPieCanvas.grid(row=3, column=1, sticky="nsew", padx=(8, 0), pady=(4, 0))
-        pieSlices = {}
-        pieTooltip = {"win": None, "item": None}
-        ppColorMap = {}
-
-        groupingFrame = tk.Frame(histWin, bg=self.bgColor)
-        groupingFrame.grid(row=0, column=3, padx=(0, 8), pady=8, sticky="ns")
-
-        groupingLabel = tk.Label(
-            groupingFrame,
-            text="Task Groups",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.textColor,
-            bg=self.bgColor
-        )
-        groupingLabel.pack(anchor="w")
-
-        taskListbox = tk.Listbox(
-            groupingFrame,
-            height=16,
-            width=26,
-            bg="#1b1f24",
-            fg=self.textColor,
-            selectbackground=self.accentColor,
-            selectforeground="#ffffff",
-            borderwidth=0,
-            highlightthickness=0,
-            font=("Segoe UI", 10),
-            selectmode=tk.EXTENDED
-        )
-        taskListbox.pack(fill="both", expand=True, pady=(4, 8))
-
-        groupEntry = tk.Entry(
-            groupingFrame,
-            font=("Segoe UI", 10),
-            bg="#1b1f24",
-            fg=self.textColor,
-            insertbackground=self.textColor,
-            relief="flat"
-        )
-        groupEntry.pack(fill="x", pady=(0, 6))
-
-        groupBtnFrame = tk.Frame(groupingFrame, bg=self.bgColor)
-        groupBtnFrame.pack(anchor="e")
-
-        setGroupBtn = tk.Button(
-            groupBtnFrame,
-            text="Set Group",
-            font=("Segoe UI", 9, "bold"),
-            bg="#1b1f24",
-            fg=self.textColor,
-            activebackground="#2c3440",
-            activeforeground=self.textColor,
-            relief="flat"
-        )
-        setGroupBtn.grid(row=0, column=0, padx=4)
-
-        clearGroupBtn = tk.Button(
-            groupBtnFrame,
-            text="Clear Group",
-            font=("Segoe UI", 9),
-            bg="#1b1f24",
-            fg=self.textColor,
-            activebackground="#2c3440",
-            activeforeground=self.textColor,
-            relief="flat"
-        )
-        clearGroupBtn.grid(row=0, column=1, padx=4)
-
-        current = {"ppIndex": 0}
-        allTasks = collectAllTasks()
-        taskNames = list(allTasks)
-
-        def formatLines(total, taskAgg):
-            lines = [f"Total: {total:.1f} h"]
-
-            grouped = {}
-            ungrouped = {}
-            for task, hours in taskAgg.items():
-                group = self.groups.get(task)
-                if group:
-                    grouped.setdefault(group, []).append((task, hours))
-                else:
-                    ungrouped[task] = hours
-
-            groupItems = []
-            for g, ths in grouped.items():
-                gHours = sum(h for _, h in ths)
-                groupItems.append((g, gHours, ths))
-
-            for g, gHours, ths in sorted(groupItems, key=lambda kv: kv[1], reverse=True):
-                lines.append(f"{g}: {gHours:.1f} h")
-                for t, h in sorted(ths, key=lambda kv: kv[1], reverse=True):
-                    lines.append(f"  {t}: {h:.1f} h")
-
-            for t, h in sorted(ungrouped.items(), key=lambda kv: kv[1], reverse=True):
-                lines.append(f"{t}: {h:.1f} h")
-
-            return lines
-
-        listItems = []
-        groupedTasks = {}
-
-        def refreshTaskList():
-            nonlocal taskNames, listItems, groupedTasks
-            taskNames = collectAllTasks()
-            listItems = []
-            groupedTasks = {}
-
-            for name in taskNames:
-                g = self.groups.get(name)
-                if g:
-                    groupedTasks.setdefault(g, []).append(name)
-
-            ungrouped = [name for name in taskNames if not self.groups.get(name)]
-
-            taskListbox.delete(0, tk.END)
-
-            for groupName in sorted(groupedTasks.keys()):
-                listItems.append(("group", groupName))
-                taskListbox.insert(tk.END, groupName)
-                for task in sorted(groupedTasks[groupName]):
-                    listItems.append(("task", task))
-                    taskListbox.insert(tk.END, f"  {task}")
-
-            for task in sorted(ungrouped):
-                listItems.append(("task", task))
-                taskListbox.insert(tk.END, task)
-
-        def selectedTaskNames():
-            sel = taskListbox.curselection()
-            if not sel:
-                return []
-            selected = []
-            seen = set()
-            for idx in sel:
-                if idx >= len(listItems):
-                    continue
-                itemType, value = listItems[idx]
-                if itemType == "task":
-                    if value not in seen:
-                        selected.append(value)
-                        seen.add(value)
-                else:
-                    for task in groupedTasks.get(value, []):
-                        if task not in seen:
-                            selected.append(task)
-                            seen.add(task)
-            return selected
-
-        def groupForSelection():
-            sel = taskListbox.curselection()
-            if not sel:
-                return None
-
-            groupsFound = set()
-            hasUngrouped = False
-
-            for idx in sel:
-                if idx >= len(listItems):
-                    continue
-                itemType, value = listItems[idx]
-                if itemType == "group":
-                    groupsFound.add(value)
-                else:
-                    g = self.groups.get(value, "")
-                    if g:
-                        groupsFound.add(g)
+    def validateEnvFile(self):
+        envPath = os.path.join(self.getBaseDir(), "posting.env")
+        
+        required = ["BASE_URL", "EMAIL", "PASSWORD"]
+        missing = []
+        
+        if not os.path.exists(envPath):
+            missing = required
+        else:
+            try:
+                with open(envPath, "r", encoding="utf-8") as f:
+                    content = f.read()
+                for key in required:
+                    if f"{key}=" not in content:
+                        missing.append(key)
                     else:
-                        hasUngrouped = True
-
-            if len(groupsFound) == 1 and not hasUngrouped:
-                return next(iter(groupsFound))
-            if not groupsFound and hasUngrouped:
-                return ""
-            return None
-
-        def drawPayPeriodPie(total, taskAgg):
-            nonlocal pieSlices, ppColorMap
-
-            ppPieCanvas.delete("all")
-            pieSlices = {}
-            ppColorMap = {}
-
-            if total <= 0 or not taskAgg:
-                return
-
-            ppPieCanvas.update_idletasks()
-            w = ppPieCanvas.winfo_width() or 160
-            h = ppPieCanvas.winfo_height() or 160
-
-            size = min(w, h) - 20
-            if size <= 0:
-                return
-
-            cx = w / 2
-            cy = h / 2
-            r = size / 2
-
-            items = sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True)
-            #TODO: settings for color preferences
-            colorFamilies = [
-                {"base": "#3f8cff", "shades": ["#60a5fa", "#1d4ed8", "#93c5fd"]},  # blue
-                {"base": "#10b981", "shades": ["#34d399", "#047857", "#6ee7b7"]},  # green
-                {"base": "#f97316", "shades": ["#fb923c", "#c2410c", "#fed7aa"]},  # orange
-                {"base": "#e11d48", "shades": ["#fb7185", "#9f1239", "#fecdd3"]},  # red
-                {"base": "#8b5cf6", "shades": ["#a855f7", "#6d28d9", "#ddd6fe"]},  # purple
-                {"base": "#06b6d4", "shades": ["#0ea5e9", "#0891b2", "#bae6fd"]},  # cyan
-                {"base": "#facc15", "shades": ["#eab308", "#ca8a04", "#fef08a"]},  # yellow
-                {"base": "#6366f1", "shades": ["#4f46e5", "#312e81", "#c7d2fe"]},  # indigo
-            ]
-
-            groups = {}
-            ungrouped = []
-            for name, hours in items:
-                if hours <= 0:
-                    continue
-                g = self.groups.get(name)
-                if g:
-                    groups.setdefault(g, []).append(name)
-                else:
-                    ungrouped.append(name)
-
-            groupNames = sorted(groups.keys())
-            taskColor = {}
-
-            # grouped tasks: same family, base + shades
-            for idx, g in enumerate(groupNames):
-                fam = colorFamilies[idx % len(colorFamilies)]
-                shades = [fam["base"]] + fam["shades"]
-                for i, taskName in enumerate(sorted(groups[g])):
-                    c = shades[i % len(shades)]
-                    taskColor[taskName] = c
-                    ppColorMap[taskName] = c
-
-            # ungrouped tasks: only main/base colors
-            offset = len(groupNames)
-            for j, taskName in enumerate(sorted(ungrouped)):
-                fam = colorFamilies[(offset + j) % len(colorFamilies)]
-                c = fam["base"]
-                taskColor[taskName] = c
-                ppColorMap[taskName] = c
-
-            startAngle = 0.0
-            for name, hours in items:
-                if hours <= 0:
-                    continue
-                extent = 360.0 * (hours / total)
-                color = taskColor.get(name, self.accentColor)
-                labelText = f"{name} ({hours:.1f}h, {hours / total * 100:.0f}%)"
-
-                item = ppPieCanvas.create_arc(
-                    cx - r,
-                    cy - r,
-                    cx + r,
-                    cy + r,
-                    start=startAngle,
-                    extent=extent,
-                    fill=color,
-                    outline="#111827"
-                )
-                pieSlices[item] = labelText
-                startAngle += extent
-
-        def showPieTooltip(event):
-            items = ppPieCanvas.find_withtag("current")
-            if not items:
-                hidePieTooltip(event)
-                return
-
-            item = items[0]
-
-            if item == pieTooltip["item"] and pieTooltip["win"] is not None:
-                return
-
-            labelText = pieSlices.get(item)
-            if not labelText:
-                hidePieTooltip(event)
-                return
-
-            if pieTooltip["win"] is not None:
-                pieTooltip["win"].destroy()
-
-            tw = tk.Toplevel(ppPieCanvas)
-            tw.wm_overrideredirect(True)
-            tw.configure(bg="#000000")
-
-            x = event.x_root + 10
-            y = event.y_root + 10
-            tw.wm_geometry(f"+{x}+{y}")
-
-            lbl = tk.Label(
-                tw,
-                text=labelText,
-                bg="#111827",
-                fg="#f9fafb",
-                font=("Segoe UI", 8)
-            )
-            lbl.pack(ipadx=4, ipady=2)
-
-            pieTooltip["win"] = tw
-            pieTooltip["item"] = item
-
-        def hidePieTooltip(event):
-            if pieTooltip["win"] is not None:
-                pieTooltip["win"].destroy()
-                pieTooltip["win"] = None
-            pieTooltip["item"] = None
-
-        def showPayPeriodSummary():
-            ppIdx = current["ppIndex"]
-            if ppIdx < 0 or ppIdx >= len(periods):
-                ppSummaryBox.delete("1.0", tk.END)
-                ppPieCanvas.delete("all")
-                return
-            p = periods[ppIdx]
-            agg = p.get("agg", {})
-            total = p.get("total", 0.0)
-
-            drawPayPeriodPie(total, agg)
-
-            lines = formatLines(total, agg)
-
-            ppSummaryBox.delete("1.0", tk.END)
-            ppSummaryBox.insert(tk.END, "\n".join(lines))
-
-            for name, color in ppColorMap.items():
-                tagName = f"pp_{name}"
-                try:
-                    ppSummaryBox.tag_configure(tagName, foreground=color)
-                except tk.TclError:
-                    continue
-
-                start = "1.0"
-                pattern = f"{name}:"
-                while True:
-                    pos = ppSummaryBox.search(pattern, start, tk.END)
-                    if not pos:
-                        break
-                    end = f"{pos}+{len(name)}c"
-                    ppSummaryBox.tag_add(tagName, pos, end)
-                    start = f"{end}+1c"
-
-        def drawTimelineForDayKey(dayKey):
-            nonlocal rectTaskMap
-
-            rectTaskMap = {}
-            timelineCanvas.delete("all")
-
-            entry = self.history.get(dayKey)
-            segments = entry.get("timeline") if isinstance(entry, dict) else []
-
-            if not segments:
-                return
-
-            # --- Calculate Dynamic Time Range ---
-            min_sec, max_sec = 24 * 3600, 0
-            valid_segments = []
-            
-            from datetime import datetime
-            
-            for seg in segments:
-                            min_sec = 24 * 3600
-            max_sec = 0
-            valid_segments = []
-
-            for seg in segments:
-                startStr = seg.get("start")
-                endStr = seg.get("end")
-                if not startStr or not endStr:
-                    continue
-
-                hStart, mStart, sStart, startSec = _parseTimeToSeconds(startStr)
-                hEnd, mEnd, sEnd, endSec = _parseTimeToSeconds(endStr)
-                if startSec is None or endSec is None:
-                    continue
-
-                if endSec > startSec:
-                    min_sec = min(min_sec, startSec)
-                    max_sec = max(max_sec, endSec)
-                    valid_segments.append({
-                        **seg,
-                        "task": seg.get("task") or "Untasked",
-                        "startSec": startSec,
-                        "endSec": endSec,
-                        "hStart": hStart,
-                        "mStart": mStart,
-                        "hEnd": hEnd,
-                        "mEnd": mEnd,
-                    })
-
-            if not valid_segments:
-                return
-
-            spanStartSec = max(0, (min_sec // 3600) * 3600)
-            spanEndSec = min(24 * 3600, ((max_sec + 3599) // 3600) * 3600)
-            spanSec = max(60.0, spanEndSec - spanStartSec)
-
-            # --- Canvas Setup and Margins ---
-            timelineCanvas.update_idletasks()
-            width = timelineCanvas.winfo_width() or 260
-            height = timelineCanvas.winfo_height() or 140
-
-            # Margin adjusted for X-axis cutoff (Change C)
-            marginLeft = 10
-            marginRight = 10
-            marginTop = 10
-            # Increased marginBottom to prevent X-axis labels from being cut off (Change C)
-            marginBottom = 30
-
-            areaTop = marginTop
-            areaBottom = height - marginBottom
-            areaBottom = areaTop + 10 if areaBottom <= areaTop else areaBottom
-
-            # --- Task Mapping and Row Calculation (Change B) ---
-            # The list of tasks defines the row order AND the key order.
-            tasks = sorted({seg["task"] for seg in valid_segments}) # Task order is now fixed
-
-            # --- Key/Plot Space Allocation (Change A) ---
-            keyWidthRatio = 0.25 # Allocate 25% of the width for the key
-            keyWidth = width * keyWidthRatio
-            
-            # Inner plotting area is the width minus the key area and margins
-            innerWidth = max(1, width - marginLeft - marginRight - keyWidth)
-            plotAreaRight = marginLeft + innerWidth # The X-coordinate where the plot area ends and the key begins
-
-            nTasks = max(1, len(tasks))
-            rowGap = 4
-            totalHeight = areaBottom - areaTop
-            rowHeight = max(6, (totalHeight - rowGap * (nTasks - 1)) / nTasks)
-
-            # taskToRow is built from the sorted tasks list
-            taskToRow = {t: i for i, t in enumerate(tasks)}
-
-            # Color Palette setup
-            palette = [
-                self.accentColor, "#10b981", "#f97316", "#e11d48",
-                "#8b5cf6", "#06b6d4", "#facc15", "#6366f1",
-            ]
-            colorMap = {}
-            pi = 0
-            for task in tasks:
-                colorMap[task] = "#444c56" if task == "Untasked" else palette[pi % len(palette)]
-                if task != "Untasked":
-                    pi += 1
-
-            # --- Draw Segments (Horizontal Bars) ---
-            for seg in valid_segments:
-                task = seg["task"]
-                startSec = seg["startSec"]
-                endSec = seg["endSec"]
-                
-                # Y calculation remains the same
-                rowIndex = taskToRow.get(task, 0)
-                y1 = areaTop + rowIndex * (rowHeight + rowGap)
-                y2 = y1 + rowHeight
-
-                # X calculation now uses the limited innerWidth
-                x1 = marginLeft + ((startSec - spanStartSec) / spanSec) * innerWidth
-                x2 = marginLeft + ((endSec - spanStartSec) / spanSec) * innerWidth
-
-                color = colorMap.get(task, self.accentColor)
-
-                item = timelineCanvas.create_rectangle(
-                    x1, y1, x2, y2,
-                    fill=color,
-                    outline=""
-                )
-                labelText = f"{task} {seg['hStart']:02d}:{seg['mStart']:02d}–{seg['hEnd']:02d}:{seg['mEnd']:02d}"
-                rectTaskMap[item] = labelText
-
-
-            # --- Draw Time Axis (X-Axis) ---
-            # X-Axis is drawn across the plot area only
-            axisY = areaBottom + 4
-            tickY1 = axisY
-            tickY2 = axisY + 4
-            labelY = axisY + 10 # This position is safer due to increased marginBottom (Change C)
-            
-            span_hours = spanSec / 3600.0
-            
-            if span_hours < 3:
-                step_sec = 1800
-            elif span_hours < 8:
-                step_sec = 3600
-            else:
-                step_sec = 10800 
-
-            first_tick_sec = (spanStartSec // step_sec + 1) * step_sec
-            ticks_sec = sorted(list(set([spanStartSec, spanEndSec] + list(range(first_tick_sec, spanEndSec, step_sec)))))
-            
-            # Draw line up to the new plotAreaRight boundary
-            timelineCanvas.create_line(marginLeft, axisY, plotAreaRight, axisY, fill="#6b7280")
-
-            for sec in ticks_sec:
-                if sec < spanStartSec or sec > spanEndSec:
-                    continue
-
-                x = marginLeft + ((sec - spanStartSec) / spanSec) * innerWidth
-                
-                # Ensure label is not drawn past the plot boundary
-                if x > plotAreaRight:
-                     continue 
-                     
-                hour = int(sec // 3600) % 24
-                time_label = f"{hour:02d}"
-
-                timelineCanvas.create_line(x, tickY1, x, tickY2, fill="#6b7280")
-                timelineCanvas.create_text(
-                    x, labelY, text=time_label,
-                    fill="#9ca3af", anchor="n",
-                    font=("Segoe UI", 7)
-                )
-
-            # --- Draw Legend (Key) ---
-            legendY = marginTop
-            legendX = plotAreaRight + 10 # Start the legend immediately after the plot area, plus a small gap
-
-            # Task order is tasks, which is sorted, matching the row order (Change B)
-            for task in tasks: 
-                color = colorMap[task]
-                
-                rect_size = 10
-                rect_gap = 4
-                row_step = 14
-
-                # Draw color box
-                timelineCanvas.create_rectangle(
-                    legendX, legendY, legendX + rect_size, legendY + rect_size,
-                    fill=color,
-                    outline=""
-                )
-                # Draw task label
-                timelineCanvas.create_text(
-                    legendX + rect_size + rect_gap,
-                    legendY + rect_size/2,
-                    text=task,
-                    anchor="w",
-                    fill="#9ca3af",
-                    font=("Segoe UI", 7)
-                )
-                legendY += row_step
-
-        def showTooltip(event):
-            items = timelineCanvas.find_withtag("current")
-            if not items:
-                hideTooltip(event)
-                return
-
-            item = items[0]
-
-            if item == tooltip["item"] and tooltip["win"] is not None:
-                return
-
-            labelText = rectTaskMap.get(item)
-            if not labelText:
-                hideTooltip(event)
-                return
-
-            if tooltip["win"] is not None:
-                tooltip["win"].destroy()
-
-            tw = tk.Toplevel(timelineCanvas)
-            tw.wm_overrideredirect(True)
-            tw.configure(bg="#000000")
-
-            x = event.x_root + 10
-            y = event.y_root + 10
-            tw.wm_geometry(f"+{x}+{y}")
-
-            lbl = tk.Label(
-                tw,
-                text=labelText,
-                bg="#111827",
-                fg="#f9fafb",
-                font=("Segoe UI", 8)
-            )
-            lbl.pack(ipadx=4, ipady=2)
-
-            tooltip["win"] = tw
-            tooltip["item"] = item
-
-        def hideTooltip(event):
-            if tooltip["win"] is not None:
-                tooltip["win"].destroy()
-                tooltip["win"] = None
-            tooltip["item"] = None
-
-
-        def showDaySummary(dayIdx):
-            ppIdx = current["ppIndex"]
-            if ppIdx < 0 or ppIdx >= len(periods):
-                daySummaryBox.delete("1.0", tk.END)
-                timelineCanvas.delete("all")
-                return
-
-            period = periods[ppIdx]
-            if dayIdx < 0 or dayIdx >= len(period["days"]):
-                daySummaryBox.delete("1.0", tk.END)
-                timelineCanvas.delete("all")
-                return
-
-            dStr = period["days"][dayIdx]
-            entry = self.history.get(dStr, "") or ""
-            if isinstance(entry, dict):
-                raw = entry.get("summary", "") or ""
-            else:
-                raw = entry
-
-            taskAgg = {}
-            total = 0.0
-            for line in raw.splitlines():
-                if ":" not in line:
-                    continue
-                name, rest = line.split(":", 1)
-                name = name.strip()
-                rest = rest.strip()
-                if not rest:
-                    continue
-                token = rest.split()[0]
-                try:
-                    hours = float(token)
-                except ValueError:
-                    continue
-                if name.lower() == "total":
-                    continue
-                taskAgg[name] = taskAgg.get(name, 0.0) + hours
-                total += hours
-
-            lines = formatLines(total, taskAgg)
-
-            daySummaryBox.delete("1.0", tk.END)
-            daySummaryBox.insert(tk.END, "\n".join(lines))
-            drawTimelineForDayKey(dStr)
-
-        def getSelectedDayIdx():
-            sel = dayListbox.curselection()
-            if not sel:
-                return None
-            return sel[0]
-
-        def refreshDays():
-            dayListbox.delete(0, tk.END)
-            ppIdx = current["ppIndex"]
-            if ppIdx < 0 or ppIdx >= len(periods):
-                daySummaryBox.delete("1.0", tk.END)
-                timelineCanvas.delete("all")
-                return
-            period = periods[ppIdx]
-            for dStr in period["days"]:
-                try:
-                    d = date.fromisoformat(dStr)
-                    label = d.strftime("%a %m-%d")
-                except ValueError:
-                    label = dStr
-                dayListbox.insert(tk.END, label)
-            showPayPeriodSummary()
-            if period["days"]:
-                dayListbox.selection_clear(0, tk.END)
-                dayListbox.selection_set(0)
-                showDaySummary(0)
-            else:
-                daySummaryBox.delete("1.0", tk.END)
-                timelineCanvas.delete("all")
-
-        def onPayPeriodSelect(event):
-            sel = ppListbox.curselection()
-            if not sel:
-                return
-            current["ppIndex"] = sel[0]
-            refreshDays()
-
-        def onDaySelect(event):
-            sel = dayListbox.curselection()
-            if not sel:
-                return
-            dayIdx = sel[0]
-            showDaySummary(dayIdx)
-
-        def onTaskSelect(event):
-            g = groupForSelection()
-            groupEntry.delete(0, tk.END)
-            if g is None:
-                return
-            if g:
-                groupEntry.insert(0, g)
-
-        def setGroup():
-            groupName = groupEntry.get().strip()
-            if not groupName:
-                return
-            for task in selectedTaskNames():
-                self.groups[task] = groupName
-            self.saveData()
-            refreshTaskList()
-            showPayPeriodSummary()
-            dayIdx = getSelectedDayIdx()
-            if dayIdx is not None:
-                showDaySummary(dayIdx)
-
-        def clearGroup():
-            changed = False
-            for task in selectedTaskNames():
-                if task in self.groups:
-                    del self.groups[task]
-                    changed = True
-            if changed:
-                self.saveData()
-                refreshTaskList()
-                showPayPeriodSummary()
-                dayIdx = getSelectedDayIdx()
-                if dayIdx is not None:
-                    showDaySummary(dayIdx)
-
-        ppListbox.bind("<<ListboxSelect>>", onPayPeriodSelect)
-        ppPieCanvas.bind("<Motion>", showPieTooltip)
-        ppPieCanvas.bind("<Leave>", hidePieTooltip)
-        timelineCanvas.bind("<Motion>", showTooltip)
-        timelineCanvas.bind("<Leave>", hideTooltip)
-        dayListbox.bind("<<ListboxSelect>>", onDaySelect)
-        taskListbox.bind("<<ListboxSelect>>", onTaskSelect)
-        setGroupBtn.config(command=setGroup)
-        clearGroupBtn.config(command=clearGroup)
-
-        btnFrame = tk.Frame(histWin, bg=self.bgColor)
-        btnFrame.grid(row=1, column=0, columnspan=4, padx=8, pady=(0, 8), sticky="e")
-
-        closeBtn = tk.Button(
-            btnFrame,
-            text="Close",
-            font=("Segoe UI", 10, "bold"),
-            bg="#1b1f24",
-            fg=self.textColor,
-            activebackground="#2c3440",
-            activeforeground=self.textColor,
-            relief="flat",
-            command=histWin.destroy
-        )
-        closeBtn.pack(anchor="e")
-
-        histWin.bind("<Escape>", lambda e: histWin.destroy())
-
-        if periods:
-            ppListbox.selection_set(0)
-            current["ppIndex"] = 0
-            refreshDays()
-            refreshTaskList()
-
+                        # Check if value is actually set (not just empty)
+                        for line in content.split("\n"):
+                            if line.startswith(f"{key}="):
+                                value = line.split("=", 1)[1].strip()
+                                if not value:
+                                    missing.append(key)
+                                break
+            except Exception:
+                missing = required
+        
+        if missing:
+            msg = "Missing posting.env configuration:\n" + ", ".join(missing)
+            self.showToast(msg, timeout=5000, error=True)
 
 if __name__ == "__main__":
     root = tk.Tk()
+    root.withdraw()
+
     app = TaskTimerApp(root)
+
+    root.update_idletasks()
+    w = max(app.baseWidth, root.winfo_reqwidth())
+    h = root.winfo_reqheight()
+    root.geometry(f"{w}x{h}")
+
+    root.deiconify()
     root.mainloop()
