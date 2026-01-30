@@ -126,8 +126,7 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
     row_gap = 6
     top_margin = 20
     min_seg_s = getattr(self, "minSegmentSeconds", 30)
-    # minimum duration for click-created segments (7 minutes)
-    click_min_s = 10 * 60
+    click_min_s = 15 * 60
 
     # build mapping from task -> row index
     rows = list(tasks)
