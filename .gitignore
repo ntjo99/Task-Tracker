@@ -4,3 +4,6 @@ settings.json
 posting.env
 cookies.txt
 __pycache__/
+build
+dist
+timesheet.spec
