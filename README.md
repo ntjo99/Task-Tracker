@@ -1,5 +1,5 @@
 # Task Tracker
-- A simple program that allows you to track your time spent on tasks.    
+##### A simple program that allows you to track your time spent on tasks.    
 
 ### History
 - In the top right of the app there is a button labelled `History`. This will show you summaries of your previous times.  
@@ -34,3 +34,4 @@
 
 ## Installer Command
 `pyinstaller --onefile --windowed --icon=hourglass.ico --add-data "hourglass.ico;." timesheet.py`
+
