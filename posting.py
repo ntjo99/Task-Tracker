@@ -169,10 +169,13 @@ def loadEnv(path="posting.env"):
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-if getattr(sys, "frozen", False):
-    _baseDir = os.path.dirname(sys.executable)
+_dataDir = os.environ.get("TaskTracker_DATA_DIR", "").strip()
+if _dataDir:
+    _baseDir = _dataDir
 else:
-    _baseDir = os.path.dirname(os.path.abspath(__file__))
+    _localAppData = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+    _baseDir = os.path.join(_localAppData, "Task Tracker")
+    os.makedirs(_baseDir, exist_ok=True)
 
 _envPath = os.path.join(_baseDir, "posting.env")
 
@@ -187,7 +190,7 @@ primePath = "/"
 loginPath = "/login"
 punchesPath = "/punches"
 
-cookieFile = "cookies.txt"
+cookieFile = os.path.join(_baseDir, "cookies.txt")
 
 
 def newSession() -> requests.Session:
@@ -393,8 +396,7 @@ def main() -> int:
     timesheetId = timesheetData["timesheetId"]
     chargeCodeIdModels = timesheetData["chargeCodeIDModels"]
 
-    insertChargeCodesBetweenGroupAndHistory("tasks.jsonl", chargeCodeIdModels)
-
+    insertChargeCodesBetweenGroupAndHistory(os.path.join(_baseDir, "tasks.jsonl"), chargeCodeIdModels)
     #postHoursWorked(s, employeeId, timesheetId, chargeCodeIdModels)
 
 ##    print(timesheetId, chargeCodeIdModels)

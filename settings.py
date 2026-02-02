@@ -62,8 +62,9 @@ def loadChargeCodesFromJsonl(dataFile):
     return chunks
 
 def openSettings(app):
-    settingsPath = os.path.join(app.getBaseDir(), "settings.json")
-    dataFile = app.realPath if hasattr(app, "realPath") else os.path.join(app.getBaseDir(), "tasks.jsonl")
+    settingsPath = os.path.join(app.getDataDir(), "settings.json")
+    dataFile = app.realPath if hasattr(app, "realPath") else os.path.join(app.getDataDir(), "tasks.jsonl")
+
 
     def parseTimeHHMM(s, fallback):
         s = (s or "").strip()
@@ -626,7 +627,7 @@ def openSettings(app):
         passwordVal = passwordVar.get().strip()
         
         if baseUrlVal or emailVal or passwordVal:
-            updatePostingEnv(app.getBaseDir(), baseUrlVal, emailVal, passwordVal)
+            updatePostingEnv(app.getDataDir(), baseUrlVal, emailVal, passwordVal)
             # Reload posting module to get updated env vars
             import importlib
             importlib.reload(posting)

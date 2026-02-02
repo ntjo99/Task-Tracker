@@ -9,20 +9,35 @@ import threading
 from datetime import date, timedelta, datetime
 from openHistory import openHistory as openHistoryImpl
 from settings import openSettings as openSettingsImpl, loadSettings as loadSettingsImpl
-import posting
+
 
 def resourcePath(relPath):
 	if hasattr(sys, "_MEIPASS"):
 		return os.path.join(sys._MEIPASS, relPath)
 	return relPath
 
-class TaskTimerApp:
+def getBaseDir(self):
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def getDataDir(self):
+    appData = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+    dataDir = os.path.join(appData, "Task Tracker")
+    os.makedirs(dataDir, exist_ok=True)
+    return dataDir
+
+class TaskTrackerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Task Timer")
+        self.root.title("Task Tracker")
         self.root.iconbitmap(resourcePath("hourglass.ico"))
 
-        self.settings = loadSettingsImpl(os.path.join(self.getBaseDir(), "settings.json"))
+        os.environ["TaskTracker_DATA_DIR"] = self.getDataDir()
+        import posting
+        self.posting = posting
+
+        self.settings = loadSettingsImpl(os.path.join(self.getDataDir(), "settings.json"))
         self.minSegmentSeconds = self.settings["minRecordedMinutes"] * 60
         self.workDayStart = self.settings["workDayStart"]
         self.workDayEnd = self.settings["workDayEnd"]
@@ -71,10 +86,9 @@ class TaskTimerApp:
 
         self.validateEnvFile()
 
-        baseDir = self.getBaseDir()
-        # always write to tasks.jsonl. For reading: prefer tasks.jsonl, otherwise fall back to tasks.example.jsonl.
+        baseDir = self.getDataDir()
         self.realPath = os.path.join(baseDir, "tasks.jsonl")
-        self.examplePath = os.path.join(baseDir, "tasks.example.jsonl")
+        self.examplePath = os.path.join(self.getBaseDir(), "tasks.example.jsonl")
 
         if os.path.exists(self.realPath):
             # use the real file when present (never touch the example)
@@ -100,7 +114,7 @@ class TaskTimerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.onClose)
 
     def getBaseDir(self):
-        return os.path.dirname(os.path.abspath(sys.argv[0]))
+        return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
     def restoreTodayTimeline(self):
         """Restore timeline from today's saved entry if it exists"""
@@ -121,7 +135,7 @@ class TaskTimerApp:
 
         title = tk.Label(
             topBar,
-            text="Task Timer",
+            text="Task Tracker",
             font=("Segoe UI", 18, "bold"),
             fg=self.textColor,
             bg=self.bgColor
@@ -340,7 +354,7 @@ class TaskTimerApp:
         desired_tasks = list(self.rows.keys())
         desired_groups = dict(self.groups or {})
 
-        dirpath = os.path.dirname(self.realPath) or "."
+        dirpath = os.path.dirname(self.realPath) or self.getDataDir()
         try:
             os.makedirs(dirpath, exist_ok=True)
         except Exception:
@@ -408,7 +422,7 @@ class TaskTimerApp:
             return
 
     def append_history_entry(self, dateKey, entry):
-        dirpath = os.path.dirname(self.realPath) or "."
+        dirpath = os.path.dirname(self.realPath) or self.getDataDir()
         try:
             os.makedirs(dirpath, exist_ok=True)
         except Exception:
@@ -1473,7 +1487,7 @@ class TaskTimerApp:
         return chargeCodesByKey
 
     def validateEnvFile(self):
-        envPath = os.path.join(self.getBaseDir(), "posting.env")
+        envPath = os.path.join(self.getDataDir(), "posting.env")
         
         required = ["BASE_URL", "EMAIL", "PASSWORD"]
         missing = []
@@ -1506,7 +1520,7 @@ if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw()
 
-    app = TaskTimerApp(root)
+    app = TaskTrackerApp(root)
 
     root.update_idletasks()
     w = max(app.baseWidth, root.winfo_reqwidth())

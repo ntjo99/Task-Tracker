@@ -681,7 +681,7 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
             sec = end_s - start_s
             per_task_seconds[s.get("task","Untasked")] = per_task_seconds.get(s.get("task","Untasked"), 0) + sec
 
-        # build summary lines with same rounding semantics as TaskTimerApp.endDay
+        # build summary lines with same rounding semantics as TaskTrackerApp.endDay
         lines = []
         totalHours = 0.0
         for name, secs in sorted(per_task_seconds.items(), key=lambda kv: kv[0].lower()):
