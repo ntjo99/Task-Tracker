@@ -6,15 +6,17 @@ import sys
 import json
 import tempfile
 import threading
+import shutil
 from datetime import date, timedelta, datetime
 from openHistory import openHistory as openHistoryImpl
 from settings import openSettings as openSettingsImpl, loadSettings as loadSettingsImpl
 
 
 def resourcePath(relPath):
-	if hasattr(sys, "_MEIPASS"):
-		return os.path.join(sys._MEIPASS, relPath)
-	return relPath
+	baseDir = getattr(sys, "_MEIPASS", None)
+	if baseDir:
+		return os.path.join(baseDir, relPath)
+	return os.path.join(os.path.dirname(os.path.abspath(__file__)), relPath)
 
 def getBaseDir(self):
     if getattr(sys, "frozen", False):
@@ -88,7 +90,9 @@ class TaskTrackerApp:
 
         baseDir = self.getDataDir()
         self.realPath = os.path.join(baseDir, "tasks.jsonl")
-        self.examplePath = os.path.join(self.getBaseDir(), "tasks.example.jsonl")
+        self.examplePath = resourcePath("tasks.example.jsonl")
+
+        self._ensureLocalDataFile()
 
         if os.path.exists(self.realPath):
             # use the real file when present (never touch the example)
@@ -112,6 +116,17 @@ class TaskTrackerApp:
 
         self.root.bind("<Delete>", self.deleteSelected)
         self.root.protocol("WM_DELETE_WINDOW", self.onClose)
+
+    def _ensureLocalDataFile(self):
+        if os.path.exists(self.realPath):
+            return
+        if not os.path.exists(self.examplePath):
+            return
+        try:
+            os.makedirs(os.path.dirname(self.realPath), exist_ok=True)
+            shutil.copyfile(self.examplePath, self.realPath)
+        except Exception:
+            pass
 
     def getBaseDir(self):
         return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))

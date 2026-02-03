@@ -4,6 +4,14 @@ settings.json
 posting.env
 cookies.txt
 __pycache__/
-build
-dist
-timesheet.spec
+build/
+dist/
+dist-installer/
+.venv/
+venv/
+*.pyc
+*.pyo
+*.pyd
+*.spec
+.DS_Store
+Thumbs.db

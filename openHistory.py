@@ -1,13 +1,16 @@
 from datetime import date, timedelta, datetime
 import tkinter as tk
+from tkinter import messagebox
 import sys
+import os
 import hashlib
 import openEdit
 
 def resourcePath(relPath):
-	if hasattr(sys, "_MEIPASS"):
-		return os.path.join(sys._MEIPASS, relPath)
-	return relPath
+	baseDir = getattr(sys, "_MEIPASS", None)
+	if baseDir:
+		return os.path.join(baseDir, relPath)
+	return os.path.join(os.path.dirname(os.path.abspath(__file__)), relPath)
 
 def openHistory(self):
         self.loadData()

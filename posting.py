@@ -172,6 +172,7 @@ def loadEnv(path="posting.env"):
 _dataDir = os.environ.get("TaskTracker_DATA_DIR", "").strip()
 if _dataDir:
     _baseDir = _dataDir
+    os.makedirs(_baseDir, exist_ok=True)
 else:
     _localAppData = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
     _baseDir = os.path.join(_localAppData, "Task Tracker")

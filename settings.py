@@ -9,9 +9,10 @@ from datetime import date
 import posting
 
 def resourcePath(relPath):
-	if hasattr(sys, "_MEIPASS"):
-		return os.path.join(sys._MEIPASS, relPath)
-	return relPath
+	baseDir = getattr(sys, "_MEIPASS", None)
+	if baseDir:
+		return os.path.join(baseDir, relPath)
+	return os.path.join(os.path.dirname(os.path.abspath(__file__)), relPath)
 
 DEFAULT_SETTINGS = {
     "workDayStart": "09:00",
@@ -722,6 +723,10 @@ def updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars):
 
 def updatePostingEnv(baseDir, baseUrl="", email="", password=""):
     """Update posting.env with provided credentials, keeping existing values if not provided"""
+    try:
+        os.makedirs(baseDir, exist_ok=True)
+    except Exception:
+        pass
     envPath = os.path.join(baseDir, "posting.env")
     
     # Load existing values
