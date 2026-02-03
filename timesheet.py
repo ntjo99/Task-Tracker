@@ -33,7 +33,12 @@ class TaskTrackerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Task Tracker")
-        self.root.iconbitmap(resourcePath("hourglass.ico"))
+        iconPath = resourcePath("hourglass.ico")
+        if os.path.exists(iconPath):
+            try:
+                self.root.iconbitmap(iconPath)
+            except Exception:
+                pass
 
         os.environ["TaskTracker_DATA_DIR"] = self.getDataDir()
         import posting
@@ -44,8 +49,8 @@ class TaskTrackerApp:
         self.workDayStart = self.settings["workDayStart"]
         self.workDayEnd = self.settings["workDayEnd"]
         self.roundToHours = self.settings["roundToHours"]
-        self.useTimesheetFunctions = self.settings.get("useTimesheetFunctions", True)
-        self.autoChargeCodes = self.settings.get("autoChargeCodes", True)
+        self.useTimesheetFunctions = self.settings.get("useTimesheetFunctions", False)
+        self.autoChargeCodes = self.settings.get("autoChargeCodes", False)
 
 
         self.bgColor = "#111315"
@@ -130,6 +135,12 @@ class TaskTrackerApp:
 
     def getBaseDir(self):
         return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+
+    def getDataDir(self):
+        appData = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+        dataDir = os.path.join(appData, "Task Tracker")
+        os.makedirs(dataDir, exist_ok=True)
+        return dataDir
 
     def restoreTodayTimeline(self):
         """Restore timeline from today's saved entry if it exists"""

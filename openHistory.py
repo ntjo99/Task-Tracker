@@ -155,7 +155,12 @@ def openHistory(self):
             self.histWin = histWin
             histWin.withdraw()
 
-            histWin.iconbitmap(resourcePath("hourglass.ico"))
+            iconPath = resourcePath("hourglass.ico")
+            if os.path.exists(iconPath):
+                try:
+                    histWin.iconbitmap(iconPath)
+                except Exception:
+                    pass
             histWin.title("History")
             histWin.configure(bg=self.bgColor)
 

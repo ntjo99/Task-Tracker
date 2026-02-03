@@ -21,8 +21,8 @@ DEFAULT_SETTINGS = {
     "roundToHours": False,
     "mainWindowWidth": 400,
     "mainWindowHeight": 400,
-    "useTimesheetFunctions": True,
-    "autoChargeCodes": True
+    "useTimesheetFunctions": False,
+    "autoChargeCodes": False
 }
 
 def loadSettings(settingsPath):
@@ -140,7 +140,12 @@ def openSettings(app):
     win.grab_set()
     win.lift()
     win.focus_force()
-    win.iconbitmap(resourcePath("hourglass.ico"))
+    iconPath = resourcePath("hourglass.ico")
+    if os.path.exists(iconPath):
+        try:
+            win.iconbitmap(iconPath)
+        except Exception:
+            pass
 
     w = 1000
     h = 550
