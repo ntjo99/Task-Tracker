@@ -6,7 +6,6 @@ import sys
 import json
 import tempfile
 import threading
-import shutil
 from datetime import date, timedelta, datetime
 from openHistory import openHistory as openHistoryImpl
 from settings import openSettings as openSettingsImpl, loadSettings as loadSettingsImpl
@@ -108,22 +107,7 @@ class TaskTrackerApp:
 
         baseDir = self.getDataDir()
         self.realPath = os.path.join(baseDir, "tasks.jsonl")
-        self.examplePath = resourcePath("tasks.example.jsonl")
-
-        self._ensureLocalDataFile()
-
-        if os.path.exists(self.realPath):
-            # use the real file when present (never touch the example)
-            self.dataFile = self.realPath
-            self.using_example = False
-        elif os.path.exists(self.examplePath):
-            # no real file yet — read from example until the user makes a change
-            self.dataFile = self.examplePath
-            self.using_example = True
-        else:
-            # neither exists — default to real path (will be created on first save)
-            self.dataFile = self.realPath
-            self.using_example = False
+        self.dataFile = self.realPath
         self.dayTimeline = []
 
         self.buildUi()
@@ -148,17 +132,6 @@ class TaskTrackerApp:
             if showToast:
                 self.showToast(f"Posting unavailable: {e}", error=True)
             return None
-
-    def _ensureLocalDataFile(self):
-        if os.path.exists(self.realPath):
-            return
-        if not os.path.exists(self.examplePath):
-            return
-        try:
-            os.makedirs(os.path.dirname(self.realPath), exist_ok=True)
-            shutil.copyfile(self.examplePath, self.realPath)
-        except Exception:
-            pass
 
     def getBaseDir(self):
         return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))

@@ -14,8 +14,8 @@
 
 ### Example JSON
 - I have included tasks.example.jsonl with example data so you can see the full features of the history summaries.
-- Tasks.jsonl will be created on the first edit of any data, either by adding/removing a task, or by creating a day summary. Once this is done, the example file will never be used again.
-- This file can be deleted without any concern.   
+- The app no longer auto-loads or copies this file. New installs start blank, and tasks.jsonl is created on first save.
+- This file can be deleted without any concern.
 
 ### Groups
 - This app has a feature to add groups. This is purely cosmetic for history purposes. Tasks you group together will show a both individual and combined times in the summaries.  
