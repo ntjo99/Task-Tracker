@@ -6,13 +6,26 @@ import re
 import sys
 import threading
 from datetime import date
-import posting
 
 def resourcePath(relPath):
+	candidates = []
+	if getattr(sys, "frozen", False):
+		exeDir = os.path.dirname(sys.executable)
+		candidates.append(exeDir)
+		candidates.append(os.path.join(exeDir, "_internal"))
 	baseDir = getattr(sys, "_MEIPASS", None)
 	if baseDir:
-		return os.path.join(baseDir, relPath)
-	return os.path.join(os.path.dirname(os.path.abspath(__file__)), relPath)
+		candidates.append(baseDir)
+	candidates.append(os.path.dirname(os.path.abspath(__file__)))
+
+	for base in candidates:
+		path = os.path.join(base, relPath)
+		if os.path.exists(path):
+			return path
+	# Fall back to first candidate or relative path
+	if candidates:
+		return os.path.join(candidates[0], relPath)
+	return relPath
 
 DEFAULT_SETTINGS = {
     "workDayStart": "09:00",
@@ -544,6 +557,7 @@ def openSettings(app):
     def pullAndRefreshChargeCodes():
         def job():
             try:
+                import posting
                 s = posting.newSession()
                 posting.primeCookies(s)
                 posting.login(s)
@@ -636,6 +650,7 @@ def openSettings(app):
             updatePostingEnv(app.getDataDir(), baseUrlVal, emailVal, passwordVal)
             # Reload posting module to get updated env vars
             import importlib
+            import posting
             importlib.reload(posting)
 
         app.settings = settings

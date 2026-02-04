@@ -13,10 +13,24 @@ from settings import openSettings as openSettingsImpl, loadSettings as loadSetti
 
 
 def resourcePath(relPath):
+	candidates = []
+	if getattr(sys, "frozen", False):
+		exeDir = os.path.dirname(sys.executable)
+		candidates.append(exeDir)
+		candidates.append(os.path.join(exeDir, "_internal"))
 	baseDir = getattr(sys, "_MEIPASS", None)
 	if baseDir:
-		return os.path.join(baseDir, relPath)
-	return os.path.join(os.path.dirname(os.path.abspath(__file__)), relPath)
+		candidates.append(baseDir)
+	candidates.append(os.path.dirname(os.path.abspath(__file__)))
+
+	for base in candidates:
+		path = os.path.join(base, relPath)
+		if os.path.exists(path):
+			return path
+	# Fall back to first candidate or relative path
+	if candidates:
+		return os.path.join(candidates[0], relPath)
+	return relPath
 
 def getBaseDir(self):
     if getattr(sys, "frozen", False):
@@ -41,8 +55,7 @@ class TaskTrackerApp:
                 pass
 
         os.environ["TaskTracker_DATA_DIR"] = self.getDataDir()
-        import posting
-        self.posting = posting
+        self._posting = None
 
         self.settings = loadSettingsImpl(os.path.join(self.getDataDir(), "settings.json"))
         self.minSegmentSeconds = self.settings["minRecordedMinutes"] * 60
@@ -120,7 +133,21 @@ class TaskTrackerApp:
         self.updateLoop()
 
         self.root.bind("<Delete>", self.deleteSelected)
+        self.root.bind("<g>", self.startGeneralTask)
+        self.root.bind("<G>", self.startGeneralTask)
         self.root.protocol("WM_DELETE_WINDOW", self.onClose)
+
+    def _getPosting(self, showToast=False):
+        if self._posting is not None:
+            return self._posting
+        try:
+            import importlib
+            self._posting = importlib.import_module("posting")
+            return self._posting
+        except Exception as e:
+            if showToast:
+                self.showToast(f"Posting unavailable: {e}", error=True)
+            return None
 
     def _ensureLocalDataFile(self):
         if os.path.exists(self.realPath):
@@ -320,6 +347,20 @@ class TaskTrackerApp:
     def onEntryReturn(self, event):
         self.addTask()
         return "break"
+
+    def startGeneralTask(self, event=None):
+        # Only trigger when the app window is focused and the user isn't typing in an entry.
+        try:
+            if self.root.focus_displayof() is None:
+                return
+            focused = self.root.focus_get()
+            if isinstance(focused, tk.Entry):
+                return
+        except Exception:
+            return
+        name = "General"
+        if name in self.rows:
+            self.startTask(name)
 
     def loadData(self):
         if not os.path.exists(self.dataFile):
@@ -722,6 +763,10 @@ class TaskTrackerApp:
 
     def initializePunchSession(self):
         try:
+            posting = self._getPosting(showToast=True)
+            if posting is None:
+                return
+
             self.punchSession = posting.newSession()
             posting.primeCookies(self.punchSession)
             
@@ -745,6 +790,10 @@ class TaskTrackerApp:
 
         def _punchInThread():
             try:
+                posting = self._getPosting(showToast=True)
+                if posting is None:
+                    return
+
                 self.initializePunchSession()
 
                 if self.punchSession is None or self.employeeId is None:
@@ -781,6 +830,10 @@ class TaskTrackerApp:
         
         def _punchOutThread():
             try:
+                posting = self._getPosting(showToast=True)
+                if posting is None:
+                    return
+
                 self.initializePunchSession()
 
                 if self.punchSession is None or self.employeeId is None:
@@ -825,6 +878,10 @@ class TaskTrackerApp:
 
         def job():
             try:
+                posting = self._getPosting(showToast=True)
+                if posting is None:
+                    return
+
                 if self.punchSession is None or self.employeeId is None:
                     self.initializePunchSession()
 
@@ -1513,6 +1570,8 @@ class TaskTrackerApp:
         return chargeCodesByKey
 
     def validateEnvFile(self):
+        if not self.useTimesheetFunctions and not self.autoChargeCodes:
+            return
         envPath = os.path.join(self.getDataDir(), "posting.env")
         
         required = ["BASE_URL", "EMAIL", "PASSWORD"]

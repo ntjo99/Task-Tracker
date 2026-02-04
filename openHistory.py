@@ -7,10 +7,24 @@ import hashlib
 import openEdit
 
 def resourcePath(relPath):
+	candidates = []
+	if getattr(sys, "frozen", False):
+		exeDir = os.path.dirname(sys.executable)
+		candidates.append(exeDir)
+		candidates.append(os.path.join(exeDir, "_internal"))
 	baseDir = getattr(sys, "_MEIPASS", None)
 	if baseDir:
-		return os.path.join(baseDir, relPath)
-	return os.path.join(os.path.dirname(os.path.abspath(__file__)), relPath)
+		candidates.append(baseDir)
+	candidates.append(os.path.dirname(os.path.abspath(__file__)))
+
+	for base in candidates:
+		path = os.path.join(base, relPath)
+		if os.path.exists(path):
+			return path
+	# Fall back to first candidate or relative path
+	if candidates:
+		return os.path.join(candidates[0], relPath)
+	return relPath
 
 def openHistory(self):
         self.loadData()
@@ -100,6 +114,10 @@ def openHistory(self):
 
         def collectAllTasks():
             names = set()
+            # Include all known tasks from the current task list.
+            if hasattr(self, "rows") and isinstance(self.rows, dict):
+                names.update(self.rows.keys())
+            # Also include any tasks found in history summaries (for legacy/removed tasks).
             for entry in self.history.values():
                 if isinstance(entry, dict):
                     summary = entry.get("summary", "") or ""

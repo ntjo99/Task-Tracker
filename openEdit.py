@@ -1,10 +1,25 @@
 import tkinter as tk
 from datetime import datetime, date, time as dtime
 import sys
+import os
 
 def resourcePath(relPath):
-	if hasattr(sys, "_MEIPASS"):
-		return os.path.join(sys._MEIPASS, relPath)
+	candidates = []
+	if getattr(sys, "frozen", False):
+		exeDir = os.path.dirname(sys.executable)
+		candidates.append(exeDir)
+		candidates.append(os.path.join(exeDir, "_internal"))
+	baseDir = getattr(sys, "_MEIPASS", None)
+	if baseDir:
+		candidates.append(baseDir)
+	candidates.append(os.path.dirname(os.path.abspath(__file__)))
+
+	for base in candidates:
+		path = os.path.join(base, relPath)
+		if os.path.exists(path):
+			return path
+	if candidates:
+		return os.path.join(candidates[0], relPath)
 	return relPath
 
 def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary, refreshDays, showDaySummary, ppColorMap, updatePeriods, tasks):
@@ -41,7 +56,12 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
 
     editor.grab_set()
 
-    editor.iconbitmap(resourcePath("hourglass.ico"))
+    iconPath = resourcePath("hourglass.ico")
+    if os.path.exists(iconPath):
+        try:
+            editor.iconbitmap(iconPath)
+        except Exception:
+            pass
 
     editor.columnconfigure(0, weight=0)
     editor.columnconfigure(1, weight=1)
