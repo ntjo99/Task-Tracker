@@ -93,11 +93,15 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
         seenChargeCodeSigs = set()
         insertedSigs = set()
         maxChunkIndex = -1
+        inserted_any = False
+        saw_group = False
+        saw_history = False
 
         def insertMissingChargeCodes():
-            nonlocal insertedSigs, maxChunkIndex
+            nonlocal insertedSigs, maxChunkIndex, inserted_any
 
             nextChunkIndex = maxChunkIndex + 1
+            wrote = 0
             for chunk in chunk4(normalized):
                 sig = chunkSignature(chunk)
                 if isAllNullIds(sig):
@@ -108,6 +112,10 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
                 dst.write(mkChargeCodeLine(groupKey, nextChunkIndex, chunk))
                 insertedSigs.add(sig)
                 nextChunkIndex += 1
+                wrote += 1
+            if wrote:
+                inserted_any = True
+            return wrote
 
         for rawLine in src:
             stripped = rawLine.strip()
@@ -125,6 +133,7 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
 
             if recType == "group":
                 dst.write(rawLine)
+                saw_group = True
                 inGroup = True
                 insertedSigs = set()
                 seenChargeCodeSigs = set()
@@ -148,12 +157,24 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
                 continue
 
             if inGroup and recType == "history":
+                saw_history = True
                 insertMissingChargeCodes()
                 inGroup = False
                 dst.write(rawLine)
                 continue
 
+            if recType == "history":
+                saw_history = True
+
             dst.write(rawLine)
+
+        # If we never found a group/history section to insert into, append at the end.
+        if not inserted_any and (not saw_group or not saw_history):
+            groupKey = ""
+            maxChunkIndex = -1
+            insertedSigs = set()
+            seenChargeCodeSigs = set()
+            insertMissingChargeCodes()
 
     os.replace(tmpPath, path)
 

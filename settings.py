@@ -35,8 +35,11 @@ DEFAULT_SETTINGS = {
     "mainWindowWidth": 400,
     "mainWindowHeight": 400,
     "useTimesheetFunctions": False,
-    "autoChargeCodes": False
+    "autoChargeCodes": False,
+    "useDefaultBaseUrl": True
 }
+
+DEFAULT_BASE_URL = "https://nearspacelaunch.hourtimesheet.com"
 
 def loadSettings(settingsPath):
     if not os.path.exists(settingsPath):
@@ -210,10 +213,14 @@ def openSettings(app):
         generalFrame,
         textvariable=workStartVar,
         font=("Segoe UI", 10),
-        bg="#2c313a",
+        bg="#2b3138",
         fg=app.textColor,
         insertbackground=app.textColor,
         relief="flat",
+        highlightthickness=1,
+        highlightbackground="#0b0e12",
+        highlightcolor="#0b0e12",
+        bd=0,
         width=10
     )
     workStartEntry.grid(row=row, column=1, sticky="e", padx=12, pady=(12, 6))
@@ -235,10 +242,14 @@ def openSettings(app):
         generalFrame,
         textvariable=workEndVar,
         font=("Segoe UI", 10),
-        bg="#2c313a",
+        bg="#2b3138",
         fg=app.textColor,
         insertbackground=app.textColor,
         relief="flat",
+        highlightthickness=1,
+        highlightbackground="#0b0e12",
+        highlightcolor="#0b0e12",
+        bd=0,
         width=10
     )
     workEndEntry.grid(row=row, column=1, sticky="e", padx=12, pady=6)
@@ -260,10 +271,14 @@ def openSettings(app):
         generalFrame,
         textvariable=minMinutesVar,
         font=("Segoe UI", 10),
-        bg="#2c313a",
+        bg="#2b3138",
         fg=app.textColor,
         insertbackground=app.textColor,
         relief="flat",
+        highlightthickness=1,
+        highlightbackground="#0b0e12",
+        highlightcolor="#0b0e12",
+        bd=0,
         width=10
     )
     minMinutesEntry.grid(row=row, column=1, sticky="e", padx=12, pady=6)
@@ -285,10 +300,14 @@ def openSettings(app):
         generalFrame,
         textvariable=mainWidthVar,
         font=("Segoe UI", 10),
-        bg="#2c313a",
+        bg="#2b3138",
         fg=app.textColor,
         insertbackground=app.textColor,
         relief="flat",
+        highlightthickness=1,
+        highlightbackground="#0b0e12",
+        highlightcolor="#0b0e12",
+        bd=0,
         width=10
     )
     mainWidthEntry.grid(row=row, column=1, sticky="e", padx=12, pady=6)
@@ -310,10 +329,14 @@ def openSettings(app):
         generalFrame,
         textvariable=mainHeightVar,
         font=("Segoe UI", 10),
-        bg="#2c313a",
+        bg="#2b3138",
         fg=app.textColor,
         insertbackground=app.textColor,
         relief="flat",
+        highlightthickness=1,
+        highlightbackground="#0b0e12",
+        highlightcolor="#0b0e12",
+        bd=0,
         width=10
     )
     mainHeightEntry.grid(row=row, column=1, sticky="e", padx=12, pady=6)
@@ -335,10 +358,14 @@ def openSettings(app):
         generalFrame,
         textvariable=baseUrlVar,
         font=("Segoe UI", 9),
-        bg="#2c313a",
+        bg="#2b3138",
         fg=app.textColor,
         insertbackground=app.textColor,
-        relief="flat"
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground="#0b0e12",
+        highlightcolor="#0b0e12",
+        bd=0
     )
     baseUrlEntry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
 
@@ -359,10 +386,14 @@ def openSettings(app):
         generalFrame,
         textvariable=emailVar,
         font=("Segoe UI", 9),
-        bg="#2c313a",
+        bg="#2b3138",
         fg=app.textColor,
         insertbackground=app.textColor,
-        relief="flat"
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground="#0b0e12",
+        highlightcolor="#0b0e12",
+        bd=0
     )
     emailEntry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
 
@@ -383,13 +414,49 @@ def openSettings(app):
         generalFrame,
         textvariable=passwordVar,
         font=("Segoe UI", 9),
-        bg="#2c313a",
+        bg="#2b3138",
         fg=app.textColor,
         insertbackground=app.textColor,
         relief="flat",
+        highlightthickness=1,
+        highlightbackground="#0b0e12",
+        highlightcolor="#0b0e12",
+        bd=0,
         show="*"
     )
     passwordEntry.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+
+    row += 1
+
+    useDefaultBaseUrlVar = tk.IntVar(value=1 if settings.get("useDefaultBaseUrl", True) else 0)
+    def applyBaseUrlState():
+        if useDefaultBaseUrlVar.get():
+            baseUrlLabel.grid_remove()
+            baseUrlEntry.grid_remove()
+            baseUrlVar.set("")
+        else:
+            baseUrlLabel.grid()
+            baseUrlEntry.grid()
+            baseUrlEntry.config(
+                state="normal",
+                bg="#2b3138",
+                fg=app.textColor,
+                highlightbackground="#0b0e12",
+                highlightcolor="#0b0e12"
+            )
+    useDefaultBaseUrlCb = tk.Checkbutton(
+        generalFrame,
+        text="Use default Base URL",
+        variable=useDefaultBaseUrlVar,
+        bg=app.cardColor,
+        fg=app.textColor,
+        activebackground=app.cardColor,
+        activeforeground=app.textColor,
+        selectcolor=app.cardColor,
+        relief="flat",
+        command=applyBaseUrlState
+    )
+    useDefaultBaseUrlCb.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 12))
 
     row += 1
 
@@ -633,6 +700,7 @@ def openSettings(app):
         settings["roundToHours"] = bool(roundToHoursVar.get())
         settings["useTimesheetFunctions"] = bool(useTimesheetVar.get())
         settings["autoChargeCodes"] = bool(autoChargeCodesVar.get())
+        settings["useDefaultBaseUrl"] = bool(useDefaultBaseUrlVar.get())
         settings["mainWindowWidth"] = w
         settings["mainWindowHeight"] = h
 
@@ -645,7 +713,10 @@ def openSettings(app):
         baseUrlVal = baseUrlVar.get().strip()
         emailVal = emailVar.get().strip()
         passwordVal = passwordVar.get().strip()
-        
+
+        if useDefaultBaseUrlVar.get():
+            baseUrlVal = DEFAULT_BASE_URL
+
         if baseUrlVal or emailVal or passwordVal:
             updatePostingEnv(app.getDataDir(), baseUrlVal, emailVal, passwordVal)
             # Reload posting module to get updated env vars
@@ -693,6 +764,9 @@ def openSettings(app):
 
     win.bind("<Escape>", lambda e: win.destroy())
     workStartEntry.focus_set()
+
+    applyBaseUrlState()
+
 
 def updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars):
     if not os.path.exists(dataFile):

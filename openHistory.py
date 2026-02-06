@@ -417,12 +417,37 @@ def openHistory(self):
         groupEntry = tk.Entry(
             groupingFrame,
             font=("Segoe UI", 10),
-            bg="#1b1f24",
+            bg="#2b3138",
             fg=self.textColor,
             insertbackground=self.textColor,
-            relief="flat"
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#0b0e12",
+            highlightcolor="#0b0e12",
+            bd=0
         )
         groupEntry.pack(fill="x", pady=(0, 6))
+
+        def applyPlaceholder(entry, text):
+            placeholderColor = "#6b7280"
+            normalColor = self.textColor
+
+            def on_focus_in(_):
+                if entry.get() == text and entry.cget("fg") == placeholderColor:
+                    entry.delete(0, tk.END)
+                    entry.config(fg=normalColor)
+
+            def on_focus_out(_):
+                if not entry.get().strip():
+                    entry.delete(0, tk.END)
+                    entry.insert(0, text)
+                    entry.config(fg=placeholderColor)
+
+            entry.bind("<FocusIn>", on_focus_in, add="+")
+            entry.bind("<FocusOut>", on_focus_out, add="+")
+            on_focus_out(None)
+
+        applyPlaceholder(groupEntry, "Group name…")
 
         groupBtnFrame = tk.Frame(groupingFrame, bg=self.bgColor)
         groupBtnFrame.pack(anchor="e")

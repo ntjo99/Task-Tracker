@@ -219,13 +219,18 @@ class TaskTrackerApp:
         self.newTaskEntry = tk.Entry(
             self.root,
             font=("Segoe UI", 11),
-            bg="#1b1f24",
+            bg="#2b3138",
             fg=self.textColor,
             insertbackground=self.textColor,
-            relief="flat"
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#0b0e12",
+            highlightcolor="#0b0e12",
+            bd=0
         )
         self.newTaskEntry.grid(row=3, column=0, padx=(12, 6), pady=6, sticky="we")
         self.newTaskEntry.bind("<Return>", self.onEntryReturn)
+        self._applyPlaceholder(self.newTaskEntry, "Add a task…")
 
         self.addTaskButton = tk.Button(
             self.root,
@@ -316,6 +321,25 @@ class TaskTrackerApp:
             self.toastTimer = None
         
         self.toastTimer = self.root.after(timeout, dismissToast)
+
+    def _applyPlaceholder(self, entry, text):
+        placeholderColor = "#6b7280"
+        normalColor = self.textColor
+
+        def on_focus_in(_):
+            if entry.get() == text and entry.cget("fg") == placeholderColor:
+                entry.delete(0, tk.END)
+                entry.config(fg=normalColor)
+
+        def on_focus_out(_):
+            if not entry.get().strip():
+                entry.delete(0, tk.END)
+                entry.insert(0, text)
+                entry.config(fg=placeholderColor)
+
+        entry.bind("<FocusIn>", on_focus_in, add="+")
+        entry.bind("<FocusOut>", on_focus_out, add="+")
+        on_focus_out(None)
 
     def onEntryReturn(self, event):
         self.addTask()
@@ -901,6 +925,15 @@ class TaskTrackerApp:
                         if groupName in chargeCodesByKey:
                             hoursByKey[groupName] += hours
 
+                # Normalize totals to match the rounded actual elapsed time.
+                target_total = round(sum(taskSeconds.values()) / 3600.0, 1)
+                current_total = round(sum(hoursByKey.values()), 1)
+                diff = round(target_total - current_total, 1)
+                if abs(diff) >= 0.05 and hoursByKey:
+                    # Adjust the largest bucket to keep totals aligned.
+                    max_key = max(hoursByKey.items(), key=lambda kv: kv[1])[0]
+                    hoursByKey[max_key] = round(hoursByKey[max_key] + diff, 1)
+
                 hadError = False
                 for key, hours in hoursByKey.items():
                     try:
@@ -1029,20 +1062,17 @@ class TaskTrackerApp:
         self.stopUnassigned(now)
 
         if self.hasUnsavedTime:
-            lines = []
-            totalHours = 0.0
-
-            for name, seconds in self.tasks.items():
-                hours = seconds / 3600.0
-                totalHours += hours
-                lines.append(f"{name}: {hours} h")
-
+            taskSecondsForSummary = dict(self.tasks)
             if self.unassignedSeconds > 0:
-                unHours = self.unassignedSeconds / 3600.0
-                totalHours += unHours
-                lines.append(f"Untasked: {unHours} h")
+                taskSecondsForSummary["Untasked"] = (
+                    taskSecondsForSummary.get("Untasked", 0.0) + self.unassignedSeconds
+                )
 
-            lines.append(f"Total: {totalHours} h")
+            roundedHours, totalHours = self._normalizeRoundedHours(taskSecondsForSummary)
+            lines = []
+            for name, hours in sorted(roundedHours.items(), key=lambda kv: kv[0].lower()):
+                lines.append(f"{name}: {hours:.1f} h")
+            lines.append(f"Total: {totalHours:.1f} h")
             summary = "\n".join(lines)
 
             todayKey = date.today().isoformat()
@@ -1091,6 +1121,11 @@ class TaskTrackerApp:
                 oldAgg, _ = self._parseSummaryText(existingText)
                 for name, hours in oldAgg.items():
                     taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
+
+            if self.unassignedSeconds > 0:
+                taskSecondsSnapshot["Untasked"] = (
+                    taskSecondsSnapshot.get("Untasked", 0.0) + self.unassignedSeconds
+                )
             
             # Punch out when closing with unsaved time
             punchThread = self.punchOut()
@@ -1288,6 +1323,22 @@ class TaskTrackerApp:
             grouped[group] = grouped.get(group, 0.0) + hours
         return grouped
 
+    def _normalizeRoundedHours(self, secondsByTask):
+        if not secondsByTask:
+            return {}, 0.0
+        raw_total_hours = sum(secondsByTask.values()) / 3600.0
+        target_total = round(raw_total_hours, 1)
+        rounded = {t: round(sec / 3600.0, 1) for t, sec in secondsByTask.items()}
+        current_total = round(sum(rounded.values()), 1)
+        diff = round(target_total - current_total, 1)
+        if abs(diff) >= 0.05:
+            for name, _ in sorted(rounded.items(), key=lambda kv: kv[1], reverse=True):
+                new_val = round(rounded[name] + diff, 1)
+                if new_val >= 0:
+                    rounded[name] = new_val
+                    break
+        return rounded, target_total
+
     def _mergeSummaryForDate(self, dateKey, newSummary, allowSkip=False):
         existingEntry = self.history.get(dateKey)
         if not existingEntry:
@@ -1302,6 +1353,12 @@ class TaskTrackerApp:
         dialog.title("Existing summary")
         dialog.configure(bg=self.bgColor)
         dialog.resizable(False, False)
+        iconPath = resourcePath("hourglass.ico")
+        if os.path.exists(iconPath):
+            try:
+                dialog.iconbitmap(iconPath)
+            except Exception:
+                pass
 
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1425,11 +1482,13 @@ class TaskTrackerApp:
         for name, hours in newAgg.items():
             combined[name] = combined.get(name, 0.0) + hours
 
-        totalHours = sum(combined.values())
+        totalHours = 0.0
         lines = []
         for name, hours in sorted(combined.items(), key=lambda kv: kv[0].lower()):
-            lines.append(f"{name}: {hours} h")
-        lines.append(f"Total: {totalHours} h")
+            rounded = round(hours, 1)
+            totalHours += rounded
+            lines.append(f"{name}: {rounded:.1f} h")
+        lines.append(f"Total: {totalHours:.1f} h")
         return "\n".join(lines), "append"
 
     def endDay(self):
@@ -1450,21 +1509,16 @@ class TaskTrackerApp:
             messagebox.showinfo("Summary", "No tasks for today.")
             return
 
-        lines = []
-        totalHours = 0.0
-
-        for name, seconds in self.tasks.items():
-            hours = seconds / 3600.0
-            rounded = round(hours, 1)
-            totalHours += rounded
-            lines.append(f"{name}: {rounded:.1f} h")
-
+        taskSecondsForSummary = dict(self.tasks)
         if self.unassignedSeconds > 0:
-            unHours = self.unassignedSeconds / 3600.0
-            unRounded = round(unHours, 1)
-            totalHours += unRounded
-            lines.append(f"Untasked: {unRounded:.1f} h")
+            taskSecondsForSummary["Untasked"] = (
+                taskSecondsForSummary.get("Untasked", 0.0) + self.unassignedSeconds
+            )
 
+        roundedHours, totalHours = self._normalizeRoundedHours(taskSecondsForSummary)
+        lines = []
+        for name, hours in sorted(roundedHours.items(), key=lambda kv: kv[0].lower()):
+            lines.append(f"{name}: {hours:.1f} h")
         lines.append(f"Total: {totalHours:.1f} h")
         summary = "\n".join(lines)
 
@@ -1500,6 +1554,11 @@ class TaskTrackerApp:
             oldAgg, _ = self._parseSummaryText(existingText)
             for name, hours in oldAgg.items():
                 taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
+
+        if self.unassignedSeconds > 0:
+            taskSecondsSnapshot["Untasked"] = (
+                taskSecondsSnapshot.get("Untasked", 0.0) + self.unassignedSeconds
+            )
 
         punchThread = self.punchOut()
         if punchThread:
