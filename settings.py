@@ -655,16 +655,36 @@ def openSettings(app):
 
     refreshBtn = tk.Button(
         chargeFrame,
-        text="Pull Previous Timesheet Charge Codes",
+        text="Load Charge Codes",
         font=("Segoe UI", 9, "bold"),
-        bg="#1b1f24",
+        bg="#2b3138",
         fg=app.textColor,
-        activebackground="#2c3440",
+        activebackground="#3a414a",
         activeforeground=app.textColor,
         relief="flat",
         command=pullAndRefreshChargeCodes
     )
     refreshBtn.grid(row=2, column=0, sticky="w", padx=12, pady=(6, 12))
+
+    def style_btn(btn, hover_bg=None):
+        normal_bg = btn.cget("bg")
+        hover = hover_bg or btn.cget("activebackground") or normal_bg
+        btn.config(cursor="hand2")
+        btn.bind("<Enter>", lambda e: btn.config(bg=hover), add="+")
+        btn.bind("<Leave>", lambda e: btn.config(bg=normal_bg), add="+")
+
+    style_btn(refreshBtn)
+
+    # Allow mouse wheel scrolling anywhere over the charge code panel.
+    def _on_mousewheel(event):
+        try:
+            delta = int(-1 * (event.delta / 120))
+        except Exception:
+            delta = -1 if event.delta > 0 else 1
+        scrollCanvas.yview_scroll(delta, "units")
+
+    for widget in (chargeFrame, scrollCanvas, tableFrame):
+        widget.bind("<MouseWheel>", _on_mousewheel)
 
 
     btnFrame = tk.Frame(win, bg=app.bgColor)
@@ -747,6 +767,7 @@ def openSettings(app):
         relief="flat",
         command=saveSettings
     )
+    style_btn(saveBtn, hover_bg="#5b98ff")
     saveBtn.pack(side="right")
 
     cancelBtn = tk.Button(
@@ -760,6 +781,7 @@ def openSettings(app):
         relief="flat",
         command=win.destroy
     )
+    style_btn(cancelBtn)
     cancelBtn.pack(side="right", padx=(0, 8))
 
     win.bind("<Escape>", lambda e: win.destroy())

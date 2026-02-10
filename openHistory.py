@@ -476,6 +476,16 @@ def openHistory(self):
         )
         clearGroupBtn.grid(row=0, column=1, padx=4)
 
+        def style_btn(btn, hover_bg=None):
+            normal_bg = btn.cget("bg")
+            hover = hover_bg or btn.cget("activebackground") or normal_bg
+            btn.config(cursor="hand2")
+            btn.bind("<Enter>", lambda e: btn.config(bg=hover), add="+")
+            btn.bind("<Leave>", lambda e: btn.config(bg=normal_bg), add="+")
+
+        for b in (timelineModeBtn, editDayBtn, ppChartModeBtn, setGroupBtn, clearGroupBtn):
+            style_btn(b)
+
         current = {"ppIndex": 0, "timelineMode": "gantt", "ppChartMode": "pie", "dayKey": None}
         allTasks = collectAllTasks()
         taskNames = list(allTasks)
@@ -1379,6 +1389,7 @@ def openHistory(self):
             relief="flat",
             command=histWin.destroy
         )
+        style_btn(closeBtn)
         closeBtn.pack(anchor="e")
 
         histWin.bind("<Escape>", lambda e: histWin.destroy())

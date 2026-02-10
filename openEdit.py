@@ -99,6 +99,16 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
     cancelBtn = tk.Button(saveRow, text="Cancel", font=("Segoe UI",10), bg="#1b1f24", fg=self.textColor, relief="flat")
     cancelBtn.pack(side="right")
 
+    def style_btn(btn, hover_bg=None):
+        normal_bg = btn.cget("bg")
+        hover = hover_bg or btn.cget("activebackground") or normal_bg
+        btn.config(cursor="hand2")
+        btn.bind("<Enter>", lambda e: btn.config(bg=hover), add="+")
+        btn.bind("<Leave>", lambda e: btn.config(bg=normal_bg), add="+")
+
+    style_btn(saveBtn, hover_bg="#5b98ff")
+    style_btn(cancelBtn)
+
     # helper: parse ISO time to seconds since midnight
     def iso_to_secs(ts):
         if not ts or "T" not in ts:
@@ -184,12 +194,13 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
         xStart = seconds_to_x(workStartSecs, cw)
         xEnd = seconds_to_x(workEndSecs, cw)
 
-        # header ticks: every 2 hours with labels
-        for hr in range(0, 25, 2):
+        # light vertical grid: every hour (only over task area)
+        for hr in range(0, 25, 1):
             # align to usable width
             x = seconds_to_x(hr*3600, cw)
-            canvas.create_line(x, 0, x, ch, fill="#0b1220")
-            canvas.create_text(x+2, 6, text=f"{hr:02d}:00", anchor="n", fill="#9ca3af", font=("Segoe UI",7))
+            canvas.create_line(x, taskAreaTop, x, taskAreaBottom, fill="#2a3442")
+            if hr % 2 == 0:
+                canvas.create_text(x+2, 6, text=f"{hr:02d}:00", anchor="n", fill="#9ca3af", font=("Segoe UI",7))
 
         # draw rows
         for i, t in enumerate(rows):
@@ -232,8 +243,36 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
 
     EDGE_MARGIN = 8
 
+    # info overlay while dragging/creating
+    info_tag = "drag_info"
+    def fmt_hhmm(secs):
+        secs = max(0, min(int(round(secs)), 24*3600-1))
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        return f"{h:02d}:{m:02d}"
+
+    def show_drag_info(x, y, start_s, end_s):
+        canvas.delete(info_tag)
+        text = f"{fmt_hhmm(start_s)} – {fmt_hhmm(end_s)}"
+        pad = 4
+        # clamp text position
+        x = max(10, min(x, (canvas.winfo_width() or 600) - 10))
+        y = max(10, min(y, (canvas.winfo_height() or 400) - 10))
+        t = canvas.create_text(x, y, text=text, anchor="sw", fill="#e5e7eb",
+                               font=("Segoe UI", 8), tags=info_tag)
+        bbox = canvas.bbox(t)
+        if bbox:
+            canvas.create_rectangle(bbox[0]-pad, bbox[1]-pad, bbox[2]+pad, bbox[3]+pad,
+                                    fill="#0b1220", outline="#1f2937", tags=info_tag)
+            canvas.tag_raise(t)
+
+    def hide_drag_info():
+        canvas.delete(info_tag)
+
     def find_item_at(x,y):
-        ids = canvas.find_overlapping(x,y,x,y)
+        # Expand hit-box slightly to make tiny segments easier to grab.
+        pad = 4
+        ids = canvas.find_overlapping(x - pad, y - pad, x + pad, y + pad)
         for iid in ids[::-1]:
             if iid in rect_map:
                 return iid
@@ -278,12 +317,18 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
             # determine edge proximity for drag/resize
             coords = canvas.coords(iid)  # x1,y1,x2,y2
             x1,x2 = coords[0], coords[2]
-            if abs(x - x1) <= EDGE_MARGIN:
-                mode = "resize_left"
-            elif abs(x - x2) <= EDGE_MARGIN:
-                mode = "resize_right"
+            width = max(1, x2 - x1)
+            edge = max(EDGE_MARGIN, min(14, width / 2))
+            # If the segment is very small, allow resize in either direction based on drag.
+            if width <= edge * 2:
+                mode = "resize_both"
             else:
-                mode = "move"
+                if abs(x - x1) <= edge:
+                    mode = "resize_left"
+                elif abs(x - x2) <= edge:
+                    mode = "resize_right"
+                else:
+                    mode = "move"
             drag["item"] = iid
             drag["mode"] = mode
             drag["x0"] = x
@@ -366,6 +411,7 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
                 segs[sidx]["end"] = secs_to_iso(end_s)
             except Exception:
                 pass
+            show_drag_info(x, y, start_s, end_s)
             return
         # normal existing-segment drag/resize behavior
         if not drag["item"]:
@@ -395,14 +441,39 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
 
             canvas.coords(iid, cx1, ny1, cx2, ny2)
             drag["temp"] = {"cx1": cx1, "cx2": cx2, "row": new_row}
+            start_s = x_to_seconds(cx1, cw)
+            end_s = x_to_seconds(cx2, cw)
+            show_drag_info(x, y, start_s, end_s)
         elif drag["mode"] == "resize_left":
             cx1 = min(x, x2-4)
             canvas.coords(iid, cx1, y1, x2, y2)
             drag["temp"] = {"cx1":cx1}
+            start_s = x_to_seconds(cx1, cw)
+            end_s = x_to_seconds(x2, cw)
+            show_drag_info(x, y, start_s, end_s)
         elif drag["mode"] == "resize_right":
             cx2 = max(x, x1+4)
             canvas.coords(iid, x1, y1, cx2, y2)
             drag["temp"] = {"cx2":cx2}
+            start_s = x_to_seconds(x1, cw)
+            end_s = x_to_seconds(cx2, cw)
+            show_drag_info(x, y, start_s, end_s)
+        elif drag["mode"] == "resize_both":
+            # Allow resizing either edge depending on drag direction.
+            if x < drag["x0"]:
+                cx1 = min(x, x2-4)
+                canvas.coords(iid, cx1, y1, x2, y2)
+                drag["temp"] = {"cx1":cx1}
+                start_s = x_to_seconds(cx1, cw)
+                end_s = x_to_seconds(x2, cw)
+                show_drag_info(x, y, start_s, end_s)
+            else:
+                cx2 = max(x, x1+4)
+                canvas.coords(iid, x1, y1, cx2, y2)
+                drag["temp"] = {"cx2":cx2}
+                start_s = x_to_seconds(x1, cw)
+                end_s = x_to_seconds(cx2, cw)
+                show_drag_info(x, y, start_s, end_s)
 
     def on_button_release(ev):
         # finalize creation (if creating) or finalize drag/resize (existing)
@@ -520,6 +591,7 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
             drag["fixed_row"] = None
             drag["item"] = None
             drag["mode"] = None
+            hide_drag_info()
             redraw()
             return
         # otherwise finalize drag/resize of existing item (original behavior)
@@ -550,6 +622,7 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
                 segs.pop(sidx)
             except Exception:
                 pass
+            hide_drag_info()
             redraw()
             drag["item"] = None
             drag["mode"] = None
@@ -644,6 +717,7 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
         resolve_overlaps_for(sidx)
         mergeSameTaskSegments()
         redraw()
+        hide_drag_info()
         drag["item"] = None
         drag["mode"] = None
 

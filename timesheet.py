@@ -179,6 +179,7 @@ class TaskTrackerApp:
             relief="flat",
             command=self.openSettings
         )
+        self._styleButton(settingsBtn)
         settingsBtn.grid(row=0, column=1, sticky="e", padx=(6, 0))
 
         clearBtn = tk.Button(
@@ -192,6 +193,7 @@ class TaskTrackerApp:
             relief="flat",
             command=self.clearDayData
         )
+        self._styleButton(clearBtn)
         clearBtn.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
         historyBtn = tk.Button(
@@ -205,6 +207,7 @@ class TaskTrackerApp:
             relief="flat",
             command=self.openHistory
         )
+        self._styleButton(historyBtn)
         historyBtn.grid(row=0, column=3, sticky="e", padx=(8, 0))
 
         subtitle = tk.Label(
@@ -243,6 +246,7 @@ class TaskTrackerApp:
             relief="flat",
             command=self.addTask
         )
+        self._styleButton(self.addTaskButton, hover_bg="#5b98ff")
         self.addTaskButton.grid(row=3, column=1, padx=(6, 12), pady=6, sticky="we")
 
         self.tasksFrame = tk.Frame(self.root, bg=self.bgColor)
@@ -262,6 +266,7 @@ class TaskTrackerApp:
             command=self.endDay,
             height=1
         )
+        self._styleButton(self.endDayButton, hover_bg="#5b98ff")
         self.endDayButton.grid(row=5, column=0, columnspan=2, padx=12, pady=(4, 12), sticky="we")
 
         self.root.columnconfigure(0, weight=1)
@@ -322,6 +327,34 @@ class TaskTrackerApp:
         
         self.toastTimer = self.root.after(timeout, dismissToast)
 
+    def _styleButton(self, btn, hover_bg=None):
+        normal_bg = btn.cget("bg")
+        hover = hover_bg or btn.cget("activebackground") or normal_bg
+        btn.config(cursor="hand2")
+        btn.bind("<Enter>", lambda e: btn.config(bg=hover), add="+")
+        btn.bind("<Leave>", lambda e: btn.config(bg=normal_bg), add="+")
+
+    def _bindTaskRowHover(self, taskName, rowFrame, nameLabel, deleteBtn, handleLabel, timeLabel):
+        hover_bg = "#262c33"
+
+        def apply_hover():
+            if self.dragTaskName is not None or self.currentTask == taskName:
+                return
+            rowFrame.config(bg=hover_bg)
+            nameLabel.config(bg=hover_bg)
+            deleteBtn.config(bg=hover_bg)
+
+        def clear_hover():
+            self.refreshRowStyles()
+
+        for widget in (rowFrame, nameLabel, timeLabel):
+            widget.config(cursor="hand2")
+            widget.bind("<Enter>", lambda e: apply_hover(), add="+")
+            widget.bind("<Leave>", lambda e: clear_hover(), add="+")
+
+        handleLabel.config(cursor="fleur")
+        handleLabel.bind("<Enter>", lambda e: apply_hover(), add="+")
+        handleLabel.bind("<Leave>", lambda e: clear_hover(), add="+")
     def _applyPlaceholder(self, entry, text):
         placeholderColor = "#6b7280"
         normalColor = self.textColor
@@ -638,6 +671,7 @@ class TaskTrackerApp:
             bd=0,
             command=lambda n=name: self.deleteTaskPrompt(n)
         )
+        self._styleButton(deleteBtn)
         deleteBtn.grid(row=0, column=2, padx=(4, 8), pady=4, sticky="ne")
 
         timeLabel = tk.Label(
@@ -654,6 +688,7 @@ class TaskTrackerApp:
         self.rows[name] = (rowFrame, nameLabel, timeLabel, deleteBtn)
         self.tasks[name] = self.tasks.get(name, 0.0)
 
+        self._bindTaskRowHover(name, rowFrame, nameLabel, deleteBtn, handleLabel, timeLabel)
     def relayoutRows(self):
         for i, name in enumerate(self.rows.keys()):
             rowFrame, nameLabel, timeLabel, deleteBtn = self.rows[name]
