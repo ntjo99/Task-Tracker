@@ -3,7 +3,6 @@ import tkinter as tk
 from tkinter import messagebox
 import sys
 import os
-import hashlib
 import openEdit
 
 def resourcePath(relPath):
@@ -597,62 +596,7 @@ def openHistory(self):
         def computePayPeriodColorMap(taskAgg):
             nonlocal ppColorMap
 
-            ppColorMap = {}
-            if not taskAgg:
-                return ppColorMap
-
-            items = sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True)
-
-            colorFamilies = [
-                {"base": "#3f8cff", "shades": ["#60a5fa", "#1d4ed8", "#93c5fd"]},
-                {"base": "#10b981", "shades": ["#34d399", "#047857", "#6ee7b7"]},
-                {"base": "#f97316", "shades": ["#fb923c", "#c2410c", "#fed7aa"]},
-                {"base": "#e11d48", "shades": ["#fb7185", "#9f1239", "#fecdd3"]},
-                {"base": "#8b5cf6", "shades": ["#a855f7", "#6d28d9", "#ddd6fe"]},
-                {"base": "#06b6d4", "shades": ["#0ea5e9", "#0891b2", "#bae6fd"]},
-                {"base": "#facc15", "shades": ["#eab308", "#ca8a04", "#fef08a"]},
-                {"base": "#6366f1", "shades": ["#4f46e5", "#312e81", "#c7d2fe"]},
-            ]
-
-            def stable_int(s: str):
-                return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
-
-            groups = {}
-            ungrouped = []
-            for name, hours in items:
-                if hours <= 0:
-                    continue
-                # preserve explicit "Untasked" as grey
-                if name == "Untasked":
-                    # assign and skip further family/group logic
-                    ppColorMap[name] = "#444c56"
-                    continue
-                g = self.groups.get(name)
-                if g:
-                    groups.setdefault(g, []).append(name)
-                else:
-                    ungrouped.append(name)
-
-            for gname, tasks_in_group in groups.items():
-                fam_idx = stable_int(gname) % len(colorFamilies)
-                fam = colorFamilies[fam_idx]
-                shades = [fam["base"]] + fam["shades"]
-                for taskName in sorted(tasks_in_group):
-                    # ensure Untasked (if ever in a group) stays grey
-                    if taskName == "Untasked":
-                        ppColorMap[taskName] = "#444c56"
-                        continue
-                    shade_idx = stable_int(taskName) % len(shades)
-                    ppColorMap[taskName] = shades[shade_idx]
-
-            for taskName in sorted(ungrouped):
-                if taskName == "Untasked":
-                    ppColorMap[taskName] = "#444c56"
-                    continue
-                fam_idx = stable_int(taskName) % len(colorFamilies)
-                fam = colorFamilies[fam_idx]
-                ppColorMap[taskName] = fam["base"]
-
+            ppColorMap = self.buildTaskColorMap(taskAgg)
             return ppColorMap
 
         def drawPayPeriodPie(total, taskAgg):

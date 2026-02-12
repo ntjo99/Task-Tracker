@@ -1,5 +1,6 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, colorchooser
+from tkinter import ttk
 import json
 import os
 import re
@@ -36,7 +37,12 @@ DEFAULT_SETTINGS = {
     "mainWindowHeight": 400,
     "useTimesheetFunctions": False,
     "autoChargeCodes": False,
-    "useDefaultBaseUrl": True
+    "reviewBeforePost": False,
+    "useDefaultBaseUrl": True,
+    "colorPalettePreset": "classic",
+    "selectedTaskUsesColor": True,
+    "taskColorOverrides": {},
+    "groupColorOverrides": {}
 }
 
 DEFAULT_BASE_URL = "https://nearspacelaunch.hourtimesheet.com"
@@ -93,60 +99,62 @@ def openSettings(app):
             return fallback
         return s
 
-    def saveSettings():
-        start = parseTimeHHMM(workStartVar.get(), settings.get("workDayStart", "09:00"))
-        end = parseTimeHHMM(workEndVar.get(), settings.get("workDayEnd", "17:00"))
-
-        try:
-            m = int(minMinutesVar.get().strip())
-            if m < 0:
-                m = 0
-        except Exception:
-            m = int(settings.get("minRecordedMinutes", 1) or 1)
-
-        try:
-            w = int(mainWidthVar.get().strip())
-        except Exception:
-            w = int(settings.get("mainWindowWidth", 400) or 400)
-
-        try:
-            h = int(mainHeightVar.get().strip())
-        except Exception:
-            h = int(settings.get("mainWindowHeight", 400) or 400)
-
-        w = max(250, w)
-        h = max(250, h)
-
-        settings["workDayStart"] = start
-        settings["workDayEnd"] = end
-        settings["minRecordedMinutes"] = m
-        settings["roundToHours"] = bool(roundToHoursVar.get())
-        settings["useTimesheetFunctions"] = bool(useTimesheetVar.get())
-        settings["autoChargeCodes"] = bool(autoChargeCodesVar.get())
-        settings["mainWindowWidth"] = w
-        settings["mainWindowHeight"] = h
-
-        with open(settingsPath, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2)
-
-        # Write charge code mappings to JSONL
-        updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars)
-
-        app.settings = settings
-        app.minSegmentSeconds = int(m * 60)
-        app.workDayStart = start
-        app.workDayEnd = end
-        app.roundToHours = bool(settings["roundToHours"])
-        app.useTimesheetFunctions = bool(settings["useTimesheetFunctions"])
-        app.autoChargeCodes = bool(settings["autoChargeCodes"])
-        app.baseWidth = w
-        app.baseHeight = h
-
-        win.destroy()
-
     settings = loadSettings(settingsPath)
     chargeCodes = loadChargeCodesFromJsonl(dataFile)
     groupChargeCodeMap = dict(settings.get("groupChargeCodeMap", {}))
+
+    def sanitizeHexColor(value):
+        if not isinstance(value, str):
+            return None
+        s = value.strip()
+        if len(s) != 7 or not s.startswith("#"):
+            return None
+        hexpart = s[1:]
+        if not all(c in "0123456789abcdefABCDEF" for c in hexpart):
+            return None
+        return "#" + hexpart.lower()
+
+    def normalizeColorMap(mapping):
+        if not isinstance(mapping, dict):
+            return {}
+        out = {}
+        for k, v in mapping.items():
+            if not isinstance(k, str):
+                continue
+            key = k.strip()
+            if not key:
+                continue
+            c = sanitizeHexColor(v)
+            if c:
+                out[key] = c
+        return out
+
+    def hex_to_rgb01(colorHex):
+        c = sanitizeHexColor(colorHex)
+        if not c:
+            return None
+        return (int(c[1:3], 16) / 255.0, int(c[3:5], 16) / 255.0, int(c[5:7], 16) / 255.0)
+
+    def color_distance(c1, c2):
+        a = hex_to_rgb01(c1)
+        b = hex_to_rgb01(c2)
+        if a is None or b is None:
+            return 999.0
+        dr = (a[0] - b[0]) * 255.0
+        dg = (a[1] - b[1]) * 255.0
+        db = (a[2] - b[2]) * 255.0
+        return (dr * dr + dg * dg + db * db) ** 0.5
+
+    taskColorOverrides = normalizeColorMap(
+        settings.get("taskColorOverrides", settings.get("taskColors", {}))
+    )
+    groupColorOverrides = normalizeColorMap(
+        settings.get("groupColorOverrides", settings.get("groupColorBases", {}))
+    )
+    originalTaskNames = set(app.rows.keys()) if hasattr(app, "rows") else set()
+    workingTaskNames = list(originalTaskNames)
+    workingGroupsByTask = dict(app.groups or {})
+    pendingTaskRenames = {}
 
     win = tk.Toplevel(app.root)
     win.title("Settings")
@@ -163,15 +171,17 @@ def openSettings(app):
         except Exception:
             pass
 
-    w = 1000
-    h = 550
-    app.root.update_idletasks()
-    rx = app.root.winfo_rootx()
-    ry = app.root.winfo_rooty()
-    rw = app.root.winfo_width()
-    rh = app.root.winfo_height()
-    x = rx + (rw - w) // 2
-    y = ry + (rh - h) // 2
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+
+    w = min(1160, max(880, sw - 120))
+    h = min(700, max(580, sh - 140))
+
+    w = min(w, max(700, sw - 40))
+    h = min(h, max(460, sh - 40))
+
+    x = max(20, (sw - w) // 2)
+    y = max(20, (sh - h) // 2)
     win.geometry(f"{w}x{h}+{x}+{y}")
 
     title = tk.Label(
@@ -184,15 +194,34 @@ def openSettings(app):
     )
     title.pack(fill="x", padx=14, pady=(12, 8))
 
-    # Create notebook/tabs for organization
+    # Organize dense settings into tabs to reduce visual crowding.
     mainFrame = tk.Frame(win, bg=app.bgColor)
     mainFrame.pack(fill="both", expand=True, padx=14, pady=(0, 10))
-    mainFrame.columnconfigure(0, weight=1)
-    mainFrame.rowconfigure(0, weight=1)
+
+    style = ttk.Style(win)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    style.configure("TTKSettings.TNotebook", background=app.bgColor, borderwidth=0)
+    style.configure(
+        "TTKSettings.TNotebook.Tab",
+        background="#1b1f24",
+        foreground=app.textColor,
+        padding=(12, 6)
+    )
+    style.map(
+        "TTKSettings.TNotebook.Tab",
+        background=[("selected", app.cardColor), ("active", "#2c3440")],
+        foreground=[("selected", app.textColor), ("active", app.textColor)]
+    )
+
+    tabs = ttk.Notebook(mainFrame, style="TTKSettings.TNotebook")
+    tabs.pack(fill="both", expand=True)
 
     # Tab 1: General settings
-    generalFrame = tk.Frame(mainFrame, bg=app.cardColor)
-    generalFrame.pack(fill="both", expand=True, side="left", padx=(0, 6))
+    generalFrame = tk.Frame(tabs, bg=app.cardColor)
+    tabs.add(generalFrame, text="General")
     generalFrame.columnconfigure(0, weight=1)
     generalFrame.columnconfigure(1, weight=0)
 
@@ -506,9 +535,560 @@ def openSettings(app):
     )
     autoChargeCodesCb.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 12))
 
-    # Tab 2: Charge Code Mapping
-    chargeFrame = tk.Frame(mainFrame, bg=app.cardColor)
-    chargeFrame.pack(fill="both", expand=True, side="right", padx=(6, 0))
+    row += 1
+
+    reviewBeforePostVar = tk.IntVar(value=1 if settings.get("reviewBeforePost", False) else 0)
+    reviewBeforePostCb = tk.Checkbutton(
+        generalFrame,
+        text="Review before posting charge codes",
+        variable=reviewBeforePostVar,
+        bg=app.cardColor,
+        fg=app.textColor,
+        activebackground=app.cardColor,
+        activeforeground=app.textColor,
+        selectcolor=app.cardColor,
+        relief="flat"
+    )
+    reviewBeforePostCb.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 12))
+
+    # Tab 2: Tasks and colors
+    paletteFrame = tk.Frame(tabs, bg=app.cardColor)
+    tabs.add(paletteFrame, text="Tasks & Colors")
+    paletteFrame.columnconfigure(0, weight=1)
+    paletteFrame.rowconfigure(4, weight=1)
+
+    paletteLabel = tk.Label(
+        paletteFrame,
+        text="Tasks and Colors",
+        font=("Segoe UI", 10, "bold"),
+        fg=app.textColor,
+        bg=app.cardColor
+    )
+    paletteLabel.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+
+    palettePresetVar = tk.StringVar(value=str(settings.get("colorPalettePreset", "classic") or "classic").capitalize())
+    selectedTaskUsesColorVar = tk.IntVar(value=1 if settings.get("selectedTaskUsesColor", True) else 0)
+
+    presetRow = tk.Frame(paletteFrame, bg=app.cardColor)
+    presetRow.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
+    presetRow.columnconfigure(1, weight=1)
+
+    tk.Label(
+        presetRow,
+        text="Palette preset:",
+        font=("Segoe UI", 9),
+        fg=app.textColor,
+        bg=app.cardColor
+    ).grid(row=0, column=0, sticky="w")
+
+    presetOptions = ["Classic", "Muted", "Bold", "Colorblind", "Vibrant"]
+    presetDrop = tk.OptionMenu(presetRow, palettePresetVar, *presetOptions)
+    presetDrop.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+    presetDrop.config(
+        bg="#2c313a",
+        fg=app.textColor,
+        activebackground="#3f5a80",
+        activeforeground=app.textColor,
+        highlightthickness=0,
+        bd=1,
+        relief="solid"
+    )
+
+    selectedTaskTintCb = tk.Checkbutton(
+        paletteFrame,
+        text="Use task color on selected task row",
+        variable=selectedTaskUsesColorVar,
+        bg=app.cardColor,
+        fg=app.textColor,
+        activebackground=app.cardColor,
+        activeforeground=app.textColor,
+        selectcolor=app.cardColor,
+        relief="flat"
+    )
+    selectedTaskTintCb.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 6))
+
+    targetsLabel = tk.Label(
+        paletteFrame,
+        text="Task and group color overrides (* = manual override)",
+        font=("Segoe UI", 9),
+        fg=app.textColor,
+        bg=app.cardColor,
+        anchor="w"
+    )
+    targetsLabel.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 4))
+
+    targetsOuter = tk.Frame(paletteFrame, bg=app.cardColor)
+    targetsOuter.grid(row=4, column=0, sticky="nsew", padx=12, pady=(0, 8))
+    targetsOuter.columnconfigure(0, weight=1)
+    targetsOuter.rowconfigure(0, weight=1)
+
+    targetsList = tk.Listbox(
+        targetsOuter,
+        height=14,
+        bg="#1b1f24",
+        fg=app.textColor,
+        selectbackground=app.accentColor,
+        selectforeground="#ffffff",
+        borderwidth=0,
+        highlightthickness=0,
+        font=("Segoe UI", 10),
+        selectmode=tk.BROWSE
+    )
+    targetsList.grid(row=0, column=0, sticky="nsew")
+    targetsScroll = tk.Scrollbar(targetsOuter, orient="vertical", command=targetsList.yview)
+    targetsScroll.grid(row=0, column=1, sticky="ns")
+    targetsList.config(yscrollcommand=targetsScroll.set)
+
+    controlsFrame = tk.Frame(paletteFrame, bg=app.cardColor)
+    controlsFrame.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 12))
+    controlsFrame.columnconfigure(0, weight=1)
+    controlsFrame.columnconfigure(1, weight=1)
+    controlsFrame.columnconfigure(2, weight=1)
+
+    previewFrame = tk.Frame(controlsFrame, bg=app.cardColor)
+    previewFrame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+    previewFrame.columnconfigure(1, weight=1)
+    tk.Label(
+        previewFrame,
+        text="Preview:",
+        font=("Segoe UI", 9),
+        fg=app.textColor,
+        bg=app.cardColor
+    ).grid(row=0, column=0, sticky="w")
+    previewSwatch = tk.Label(
+        previewFrame,
+        text="      ",
+        font=("Segoe UI", 9),
+        bg="#2b3138",
+        fg=app.textColor,
+        relief="solid",
+        bd=1
+    )
+    previewSwatch.grid(row=0, column=1, sticky="w", padx=(8, 8))
+    previewText = tk.Label(
+        previewFrame,
+        text="",
+        font=("Segoe UI", 9),
+        fg="#9ca3af",
+        bg=app.cardColor
+    )
+    previewText.grid(row=0, column=2, sticky="w")
+
+    renameVar = tk.StringVar(value="")
+    renameEntry = tk.Entry(
+        controlsFrame,
+        textvariable=renameVar,
+        font=("Segoe UI", 9),
+        bg="#2b3138",
+        fg=app.textColor,
+        insertbackground=app.textColor,
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground="#0b0e12",
+        highlightcolor="#0b0e12",
+        bd=0
+    )
+    renameEntry.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+
+    renameBtn = tk.Button(
+        controlsFrame,
+        text="Rename Task",
+        font=("Segoe UI", 9, "bold"),
+        bg="#1b1f24",
+        fg=app.textColor,
+        activebackground="#2c3440",
+        activeforeground=app.textColor,
+        relief="flat"
+    )
+    renameBtn.grid(row=1, column=1, sticky="ew", padx=3)
+
+    autoColorBtn = tk.Button(
+        controlsFrame,
+        text="Use Auto Color",
+        font=("Segoe UI", 9),
+        bg="#1b1f24",
+        fg=app.textColor,
+        activebackground="#2c3440",
+        activeforeground=app.textColor,
+        relief="flat"
+    )
+    autoColorBtn.grid(row=1, column=2, sticky="ew", padx=(6, 0))
+
+    customColorBtn = tk.Button(
+        controlsFrame,
+        text="Pick Custom...",
+        font=("Segoe UI", 9, "bold"),
+        bg="#2b3138",
+        fg=app.textColor,
+        activebackground="#3a414a",
+        activeforeground=app.textColor,
+        relief="flat"
+    )
+    customColorBtn.grid(row=2, column=0, sticky="ew", pady=(6, 0), padx=(0, 6))
+
+    clearOverridesBtn = tk.Button(
+        controlsFrame,
+        text="Clear All Overrides",
+        font=("Segoe UI", 9),
+        bg="#1b1f24",
+        fg=app.textColor,
+        activebackground="#2c3440",
+        activeforeground=app.textColor,
+        relief="flat"
+    )
+    clearOverridesBtn.grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=3)
+
+    swatchFrame = tk.Frame(controlsFrame, bg=app.cardColor)
+    swatchFrame.grid(row=2, column=2, sticky="ew", pady=(6, 0), padx=(6, 0))
+    for col in range(4):
+        swatchFrame.columnconfigure(col, weight=1)
+
+    colorTargets = []
+
+    def sortedTasks():
+        return sorted(set(workingTaskNames), key=lambda s: s.lower())
+
+    def sortedGroups():
+        groups = set()
+        for t in sortedTasks():
+            g = (workingGroupsByTask.get(t) or "").strip()
+            if g:
+                groups.add(g)
+        return sorted(groups, key=lambda s: s.lower())
+
+    def swatchesForPreset(presetName):
+        p = str(presetName or "classic").strip().lower()
+
+        if p == "muted":
+            return [
+                "#6486a8", "#5e9b88", "#ad8c6c", "#b57a88",
+                "#8f8ac4", "#7a93a0", "#7f9b6a", "#a07aa6",
+                "#9a8f6b", "#6f8ea3", "#8a7f73", "#6f7f9a",
+            ]
+
+        if p == "bold":
+            return [
+                "#236dff", "#04a86b", "#ff6d00", "#d6024f",
+                "#6d28d9", "#008cb3", "#00b3a4", "#ff3d00",
+                "#22c55e", "#f43f5e", "#a855f7", "#0ea5e9",
+            ]
+
+        if p == "colorblind":
+            return [
+                "#0072b2", "#009e73", "#e69f00", "#d55e00",
+                "#cc79a7", "#56b4e9", "#000000", "#f0e442",
+                "#326174", "#332288", "#88ccee", "#117733",
+            ]
+
+        if p == "vibrant":
+            return [
+            "#3f8cff", "#10b981", "#f97316", "#e11d48",
+            "#8b5cf6", "#06b6d4", "#22c55e", "#f59e0b",
+            "#ef4444", "#a78bfa", "#14b8a6", "#60a5fa",
+        ]
+        return [
+            "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+            "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+            "#bcbd22", "#17becf", "#4c78a8", "#f58518",
+        ]
+
+        
+
+
+    def buildPreviewColorMap(taskOverrides=None, groupOverrides=None):
+        tasks = sortedTasks()
+        hours = {}
+        n = max(1, len(tasks))
+        for idx, name in enumerate(tasks):
+            hours[name] = float(n - idx)
+        if taskOverrides is None:
+            taskOverrides = taskColorOverrides
+        if groupOverrides is None:
+            groupOverrides = groupColorOverrides
+        return app.buildTaskColorMap(
+            taskHours=hours,
+            groupsOverride=workingGroupsByTask,
+            taskColorOverrides=taskOverrides,
+            groupColorOverrides=groupOverrides,
+            presetName=palettePresetVar.get().lower()
+        )
+
+    def selectedTarget():
+        sel = targetsList.curselection()
+        if not sel:
+            return None, None
+        idx = sel[0]
+        if idx < 0 or idx >= len(colorTargets):
+            return None, None
+        return colorTargets[idx]
+
+    def selectedColor():
+        kind, name = selectedTarget()
+        if not kind or not name:
+            return None
+        cmap = buildPreviewColorMap()
+        if kind == "task":
+            return cmap.get(name, app.accentColor)
+        if kind == "group":
+            if name in groupColorOverrides:
+                return groupColorOverrides[name]
+            tasks = [t for t in sortedTasks() if (workingGroupsByTask.get(t) or "").strip() == name]
+            if tasks:
+                return cmap.get(tasks[0], app.accentColor)
+        return app.accentColor
+
+    def nearest_color_conflict(kind, name, colorHex, previewMap):
+        c = sanitizeHexColor(colorHex)
+        if not c:
+            return None
+
+        best = None
+        for taskName, taskColor in previewMap.items():
+            tc = sanitizeHexColor(taskColor)
+            if not tc:
+                continue
+            if kind == "task" and taskName == name:
+                continue
+            # For group edits, skip tasks inside the same group from closeness warning.
+            if kind == "group":
+                g = (workingGroupsByTask.get(taskName) or "").strip()
+                if g == name:
+                    continue
+            d = color_distance(c, tc)
+            if best is None or d < best[2]:
+                best = ("task", taskName, d)
+        return best
+
+    def should_accept_color(kind, name, colorHex, previewMap):
+        c = sanitizeHexColor(colorHex)
+        if not c:
+            return False
+
+        conflict = nearest_color_conflict(kind, name, c, previewMap)
+        if conflict and conflict[2] < 22.0:
+            _, otherName, dist = conflict
+            ok = messagebox.askyesno(
+                "Similar Color",
+                f"This color is very close to '{otherName}' (distance {dist:.1f}).\n\nApply anyway?"
+            )
+            if not ok:
+                return False
+
+        if color_distance(c, app.cardColor) < 28.0:
+            ok = messagebox.askyesno(
+                "Low Contrast Color",
+                "This color is very close to the app background.\n\nApply anyway?"
+            )
+            if not ok:
+                return False
+
+        return True
+
+    def refreshSwatches():
+        for child in swatchFrame.winfo_children():
+            child.destroy()
+        swatches = swatchesForPreset(palettePresetVar.get().lower())
+        for i, color in enumerate(swatches):
+            btn = tk.Button(
+                swatchFrame,
+                text="",
+                width=2,
+                bg=color,
+                activebackground=color,
+                relief="flat",
+                command=lambda c=color: applyManualColor(c)
+            )
+            btn.grid(row=i // 4, column=i % 4, padx=2, pady=2, sticky="ew")
+
+    def refreshTargetList(selectKind=None, selectName=None):
+        nonlocal colorTargets
+        previous = selectedTarget()
+        if selectKind is None and selectName is None:
+            selectKind, selectName = previous
+
+        colorTargets = []
+        targetsList.delete(0, tk.END)
+
+        for task in sortedTasks():
+            mark = "*" if task in taskColorOverrides else " "
+            colorTargets.append(("task", task))
+            targetsList.insert(tk.END, f"T{mark} {task}")
+
+        for group in sortedGroups():
+            mark = "*" if group in groupColorOverrides else " "
+            colorTargets.append(("group", group))
+            targetsList.insert(tk.END, f"G{mark} {group}")
+
+        if not colorTargets:
+            return
+
+        targetIdx = 0
+        if selectKind and selectName:
+            for idx, item in enumerate(colorTargets):
+                if item == (selectKind, selectName):
+                    targetIdx = idx
+                    break
+        targetsList.selection_clear(0, tk.END)
+        targetsList.selection_set(targetIdx)
+
+    def refreshSelectionState(_event=None):
+        kind, name = selectedTarget()
+        c = selectedColor()
+        if c:
+            previewSwatch.config(bg=c)
+        else:
+            previewSwatch.config(bg="#2b3138")
+
+        if kind == "task" and name:
+            renameEntry.config(state="normal")
+            renameBtn.config(state="normal")
+            renameVar.set(name)
+            mode = "manual" if name in taskColorOverrides else "auto"
+            previewText.config(text=f"{name} ({mode})")
+        elif kind == "group" and name:
+            renameEntry.config(state="disabled")
+            renameBtn.config(state="disabled")
+            renameVar.set("")
+            mode = "manual" if name in groupColorOverrides else "auto"
+            previewText.config(text=f"group {name} ({mode})")
+        else:
+            renameEntry.config(state="disabled")
+            renameBtn.config(state="disabled")
+            renameVar.set("")
+            previewText.config(text="")
+
+    def applyManualColor(colorHex):
+        c = sanitizeHexColor(colorHex)
+        if not c:
+            return
+        kind, name = selectedTarget()
+        if not kind or not name:
+            return
+
+        nextTaskOverrides = dict(taskColorOverrides)
+        nextGroupOverrides = dict(groupColorOverrides)
+
+        if kind == "task":
+            currentMap = buildPreviewColorMap()
+            previousColor = sanitizeHexColor(currentMap.get(name))
+
+            collisionTask = None
+            collisionDist = None
+            threshold = 22.0
+
+            for taskName, color in currentMap.items():
+                if taskName == name:
+                    continue
+                other = sanitizeHexColor(color)
+                if not other:
+                    continue
+                d = color_distance(other, c)
+                if collisionDist is None or d < collisionDist:
+                    collisionDist = d
+                    collisionTask = taskName
+
+            nextTaskOverrides[name] = c
+
+            if collisionTask and collisionDist is not None and collisionDist <= threshold and previousColor and previousColor != c:
+                nextTaskOverrides[collisionTask] = previousColor
+        elif kind == "group":
+            nextGroupOverrides[name] = c
+
+
+        previewAfter = buildPreviewColorMap(nextTaskOverrides, nextGroupOverrides)
+        if not should_accept_color(kind, name, c, previewAfter):
+            return
+
+        taskColorOverrides.clear()
+        taskColorOverrides.update(nextTaskOverrides)
+        groupColorOverrides.clear()
+        groupColorOverrides.update(nextGroupOverrides)
+
+        refreshTargetList(kind, name)
+        refreshSelectionState()
+
+    def clearSelectedManualColor():
+        kind, name = selectedTarget()
+        if not kind or not name:
+            return
+        if kind == "task":
+            taskColorOverrides.pop(name, None)
+        elif kind == "group":
+            groupColorOverrides.pop(name, None)
+        refreshTargetList(kind, name)
+        refreshSelectionState()
+
+    def pickCustomColor():
+        kind, name = selectedTarget()
+        if not kind or not name:
+            return
+        initial = selectedColor() or app.accentColor
+        _, picked = colorchooser.askcolor(color=initial, parent=win, title="Pick color")
+        c = sanitizeHexColor(picked)
+        if c:
+            applyManualColor(c)
+
+    def clearAllOverrides():
+        taskColorOverrides.clear()
+        groupColorOverrides.clear()
+        refreshTargetList()
+        refreshSelectionState()
+
+    def renameSelectedTask():
+        kind, oldName = selectedTarget()
+        if kind != "task" or not oldName:
+            return
+        newName = (renameVar.get() or "").strip()
+        if not newName:
+            messagebox.showerror("Rename Task", "Task name cannot be empty.")
+            return
+        if newName == oldName:
+            return
+        if newName in set(sortedTasks()):
+            messagebox.showerror("Rename Task", f"Task '{newName}' already exists.")
+            return
+
+        for idx, existing in enumerate(workingTaskNames):
+            if existing == oldName:
+                workingTaskNames[idx] = newName
+                break
+
+        if oldName in workingGroupsByTask:
+            workingGroupsByTask[newName] = workingGroupsByTask.pop(oldName)
+
+        if oldName in taskColorOverrides:
+            taskColorOverrides[newName] = taskColorOverrides.pop(oldName)
+
+        for src, dst in list(pendingTaskRenames.items()):
+            if dst == oldName:
+                pendingTaskRenames[src] = newName
+
+        if oldName in pendingTaskRenames:
+            pendingTaskRenames[oldName] = newName
+        elif oldName in originalTaskNames:
+            pendingTaskRenames[oldName] = newName
+
+        for src in list(pendingTaskRenames.keys()):
+            if pendingTaskRenames.get(src) == src:
+                del pendingTaskRenames[src]
+
+        refreshTargetList("task", newName)
+        refreshSelectionState()
+
+    renameBtn.config(command=renameSelectedTask)
+    autoColorBtn.config(command=clearSelectedManualColor)
+    customColorBtn.config(command=pickCustomColor)
+    clearOverridesBtn.config(command=clearAllOverrides)
+    palettePresetVar.trace_add("write", lambda *_: (refreshSwatches(), refreshSelectionState()))
+    targetsList.bind("<<ListboxSelect>>", refreshSelectionState)
+
+    refreshSwatches()
+    refreshTargetList()
+    refreshSelectionState()
+
+    # Tab 3: Charge Code Mapping
+    chargeFrame = tk.Frame(tabs, bg=app.cardColor)
+    tabs.add(chargeFrame, text="Charge Codes")
     chargeFrame.columnconfigure(0, weight=1)
     chargeFrame.rowconfigure(1, weight=1)
 
@@ -622,6 +1202,16 @@ def openSettings(app):
         scrollCanvas.config(scrollregion=scrollCanvas.bbox("all"))
 
     def pullAndRefreshChargeCodes():
+        if str(refreshBtn.cget("state")) == "disabled":
+            return
+        prev_text = refreshBtn.cget("text")
+        refreshBtn.config(state="disabled")
+        refreshBtn.config(text="Loading…")
+        try:
+            app.root.config(cursor="watch")
+            app.root.update_idletasks()
+        except Exception:
+            pass
         def job():
             try:
                 import posting
@@ -648,6 +1238,16 @@ def openSettings(app):
                     win.after(0, lambda: app.showToast(f"Charge code refresh failed: {e}", timeout=6000, error=True))
                 else:
                     win.after(0, lambda: messagebox.showerror("Charge code refresh failed", str(e)))
+            finally:
+                def _reset():
+                    refreshBtn.config(state="normal")
+                    refreshBtn.config(text=prev_text)
+                    try:
+                        app.root.config(cursor="")
+                        app.root.update_idletasks()
+                    except Exception:
+                        pass
+                win.after(0, _reset)
 
         threading.Thread(target=job, daemon=True).start()
 
@@ -674,6 +1274,8 @@ def openSettings(app):
         btn.bind("<Leave>", lambda e: btn.config(bg=normal_bg), add="+")
 
     style_btn(refreshBtn)
+    for b in (renameBtn, autoColorBtn, customColorBtn, clearOverridesBtn):
+        style_btn(b)
 
     # Allow mouse wheel scrolling anywhere over the charge code panel.
     def _on_mousewheel(event):
@@ -720,15 +1322,51 @@ def openSettings(app):
         settings["roundToHours"] = bool(roundToHoursVar.get())
         settings["useTimesheetFunctions"] = bool(useTimesheetVar.get())
         settings["autoChargeCodes"] = bool(autoChargeCodesVar.get())
+        settings["reviewBeforePost"] = bool(reviewBeforePostVar.get())
         settings["useDefaultBaseUrl"] = bool(useDefaultBaseUrlVar.get())
         settings["mainWindowWidth"] = w
         settings["mainWindowHeight"] = h
+        settings["colorPalettePreset"] = str(palettePresetVar.get().lower() or "classic").strip().lower()
+        settings["selectedTaskUsesColor"] = bool(selectedTaskUsesColorVar.get())
+
+        cleanedTaskOverrides = normalizeColorMap(taskColorOverrides)
+        cleanedGroupOverrides = normalizeColorMap(groupColorOverrides)
+        settings["taskColorOverrides"] = dict(sorted(cleanedTaskOverrides.items(), key=lambda kv: kv[0].lower()))
+        settings["groupColorOverrides"] = dict(sorted(cleanedGroupOverrides.items(), key=lambda kv: kv[0].lower()))
+        # Backward-compatible aliases.
+        settings["taskColors"] = dict(settings["taskColorOverrides"])
+        settings["groupColorBases"] = dict(settings["groupColorOverrides"])
+
+        renamePairs = [(src, dst) for src, dst in pendingTaskRenames.items() if src and dst and src != dst]
+        renamePairs.sort(key=lambda kv: kv[0].lower())
+        renamedAny = False
+        for oldName, newName in renamePairs:
+            ok, msg = app.renameTask(oldName, newName, persist=False)
+            if not ok:
+                messagebox.showerror("Rename Task", msg or f"Unable to rename '{oldName}' to '{newName}'.")
+                return
+            renamedAny = True
+
+        if renamePairs:
+            renameMap = dict(renamePairs)
+            for _, var in chargeCodeVars.items():
+                currentVal = (var.get() or "").strip()
+                mapped = renameMap.get(currentVal)
+                if mapped:
+                    var.set(mapped)
 
         with open(settingsPath, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
 
         # Write charge code mappings to JSONL
         updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars)
+        if renamedAny:
+            if hasattr(app, "rewrite_data_file"):
+                if not app.rewrite_data_file():
+                    messagebox.showerror("Save Failed", "Renamed tasks were applied in memory, but history could not be rewritten to disk.")
+                    return
+            else:
+                app.saveData()
 
         baseUrlVal = baseUrlVar.get().strip()
         emailVal = emailVar.get().strip()
@@ -751,8 +1389,19 @@ def openSettings(app):
         app.roundToHours = bool(settings["roundToHours"])
         app.useTimesheetFunctions = bool(settings["useTimesheetFunctions"])
         app.autoChargeCodes = bool(settings["autoChargeCodes"])
+        app.reviewBeforePost = bool(settings.get("reviewBeforePost", False))
         app.baseWidth = w
         app.baseHeight = h
+        app.colorPalettePreset = settings["colorPalettePreset"]
+        app.selectedTaskUsesColor = bool(settings["selectedTaskUsesColor"])
+        app.taskColorOverrides = dict(settings["taskColorOverrides"])
+        app.groupColorOverrides = dict(settings["groupColorOverrides"])
+        if hasattr(app, "_cachedChargeCodesTs"):
+            app._cachedChargeCodesTs = 0.0
+        if hasattr(app, "_ensureColorSettingsConsistency"):
+            app._ensureColorSettingsConsistency()
+        if hasattr(app, "refreshRowStyles"):
+            app.refreshRowStyles()
 
         win.destroy()
 

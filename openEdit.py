@@ -96,7 +96,16 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
     saveRow.pack(fill="x", pady=(6,0))
     saveBtn = tk.Button(saveRow, text="Save", font=("Segoe UI",10,"bold"), bg=self.accentColor, fg="#fff", relief="flat")
     saveBtn.pack(side="right", padx=4)
-    cancelBtn = tk.Button(saveRow, text="Cancel", font=("Segoe UI",10), bg="#1b1f24", fg=self.textColor, relief="flat")
+    cancelBtn = tk.Button(
+        saveRow,
+        text="Cancel",
+        font=("Segoe UI",10),
+        bg="#1b1f24",
+        fg=self.textColor,
+        activebackground="#2c3440",
+        activeforeground=self.textColor,
+        relief="flat"
+    )
     cancelBtn.pack(side="right")
 
     def style_btn(btn, hover_bg=None):
@@ -223,7 +232,12 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
             # clamp
             if c2 - c1 < 4:
                 c2 = c1 + 4
-            color = ppColorMap.get(task, self.accentColor) if ppColorMap else self.accentColor
+            if ppColorMap and task in ppColorMap:
+                color = ppColorMap.get(task, self.accentColor)
+            elif hasattr(self, "getTaskDisplayColor"):
+                color = self.getTaskDisplayColor(task)
+            else:
+                color = self.accentColor
             item = canvas.create_rectangle(c1, y, c2, y+row_h, fill=color, outline="#0f1720")
             rect_map[item] = idx
             item_info[item] = {"seg": idx}
@@ -348,7 +362,12 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
             cx = seconds_to_x(start_s, cw)
             y1 = top_margin + rowidx * (row_h + row_gap)
             y2 = y1 + row_h
-            color = ppColorMap.get(task, self.accentColor) if ppColorMap else self.accentColor
+            if ppColorMap and task in ppColorMap:
+                color = ppColorMap.get(task, self.accentColor)
+            elif hasattr(self, "getTaskDisplayColor"):
+                color = self.getTaskDisplayColor(task)
+            else:
+                color = self.accentColor
             item = canvas.create_rectangle(cx, y1, cx + 4, y2, fill=color, outline="#0f1720")
             # append provisional segment to segs and map
             segs.append({"task": task, "start": secs_to_iso(start_s), "end": secs_to_iso(start_s)})
@@ -776,12 +795,19 @@ def open_day_editor(self, parent, dayKey, periods, current, showPayPeriodSummary
             per_task_seconds[s.get("task","Untasked")] = per_task_seconds.get(s.get("task","Untasked"), 0) + sec
 
         # build summary lines with same rounding semantics as TaskTrackerApp.endDay
+        if hasattr(self, "_normalizeRoundedHours"):
+            rounded_hours, totalHours = self._normalizeRoundedHours(per_task_seconds)
+        else:
+            rounded_hours = {}
+            totalHours = 0.0
+            for name, secs in per_task_seconds.items():
+                h = round((secs / 3600.0), 1)
+                if h > 0:
+                    rounded_hours[name] = h
+                    totalHours += h
+
         lines = []
-        totalHours = 0.0
-        for name, secs in sorted(per_task_seconds.items(), key=lambda kv: kv[0].lower()):
-            hours = secs / 3600.0
-            rounded = round(hours, 1)
-            totalHours += rounded
+        for name, rounded in sorted(rounded_hours.items(), key=lambda kv: kv[0].lower()):
             lines.append(f"{name}: {rounded:.1f} h")
         lines.append(f"Total: {totalHours:.1f} h")
         computed_summary = "\n".join(lines)

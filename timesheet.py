@@ -6,6 +6,8 @@ import sys
 import json
 import tempfile
 import threading
+import hashlib
+import colorsys
 from datetime import date, timedelta, datetime
 from openHistory import openHistory as openHistoryImpl
 from settings import openSettings as openSettingsImpl, loadSettings as loadSettingsImpl
@@ -63,6 +65,15 @@ class TaskTrackerApp:
         self.roundToHours = self.settings["roundToHours"]
         self.useTimesheetFunctions = self.settings.get("useTimesheetFunctions", False)
         self.autoChargeCodes = self.settings.get("autoChargeCodes", False)
+        self.reviewBeforePost = bool(self.settings.get("reviewBeforePost", False))
+        self.colorPalettePreset = str(self.settings.get("colorPalettePreset", "vibrant") or "vibrant")
+        self.selectedTaskUsesColor = bool(self.settings.get("selectedTaskUsesColor", True))
+        self.taskColorOverrides = self._normalizeColorMap(
+            self.settings.get("taskColorOverrides", self.settings.get("taskColors", {}))
+        )
+        self.groupColorOverrides = self._normalizeColorMap(
+            self.settings.get("groupColorOverrides", self.settings.get("groupColorBases", {}))
+        )
 
 
         self.bgColor = "#111315"
@@ -102,6 +113,10 @@ class TaskTrackerApp:
 
         self.toastWindow = None
         self.toastTimer = None
+        self._busyCount = 0
+        self._nextStatusRefreshTs = 0.0
+        self._cachedChargeCodesByKey = {}
+        self._cachedChargeCodesTs = 0.0
 
         self.validateEnvFile()
 
@@ -120,6 +135,425 @@ class TaskTrackerApp:
         self.root.bind("<g>", self.startGeneralTask)
         self.root.bind("<G>", self.startGeneralTask)
         self.root.protocol("WM_DELETE_WINDOW", self.onClose)
+
+    def _clamp01(self, x):
+        try:
+            return max(0.0, min(1.0, float(x)))
+        except Exception:
+            return 0.0
+
+    def _sanitizeHexColor(self, value, fallback=None):
+        if isinstance(value, str):
+            s = value.strip()
+            if len(s) == 7 and s.startswith("#"):
+                hexpart = s[1:]
+                if all(c in "0123456789abcdefABCDEF" for c in hexpart):
+                    return "#" + hexpart.lower()
+        return fallback
+
+    def _normalizeColorMap(self, mapping):
+        if not isinstance(mapping, dict):
+            return {}
+        out = {}
+        for k, v in mapping.items():
+            if not isinstance(k, str):
+                continue
+            key = k.strip()
+            if not key:
+                continue
+            c = self._sanitizeHexColor(v)
+            if c:
+                out[key] = c
+        return out
+
+    def _canonicalKey(self, value):
+        if value is None:
+            return ""
+        return str(value).strip().casefold()
+
+    def _lookupOverrideColor(self, mapping, key):
+        if not isinstance(mapping, dict):
+            return None
+        if key in mapping:
+            return mapping.get(key)
+        target = self._canonicalKey(key)
+        if not target:
+            return None
+        for k, v in mapping.items():
+            if self._canonicalKey(k) == target:
+                return v
+        return None
+
+    def _lookupGroupForTask(self, groupsMap, taskName):
+        if not isinstance(groupsMap, dict):
+            return ""
+        if taskName in groupsMap:
+            return str(groupsMap.get(taskName) or "").strip()
+        target = self._canonicalKey(taskName)
+        if not target:
+            return ""
+        for k, v in groupsMap.items():
+            if self._canonicalKey(k) == target:
+                return str(v or "").strip()
+        return ""
+
+    def _hexToRgb01(self, hexColor):
+        c = self._sanitizeHexColor(hexColor, "#000000")
+        return (int(c[1:3], 16) / 255.0, int(c[3:5], 16) / 255.0, int(c[5:7], 16) / 255.0)
+
+    def _rgb01ToHex(self, r, g, b):
+        ri = int(round(self._clamp01(r) * 255))
+        gi = int(round(self._clamp01(g) * 255))
+        bi = int(round(self._clamp01(b) * 255))
+        return f"#{ri:02x}{gi:02x}{bi:02x}"
+
+    def _mixHex(self, c1, c2, t):
+        t = self._clamp01(t)
+        r1, g1, b1 = self._hexToRgb01(c1)
+        r2, g2, b2 = self._hexToRgb01(c2)
+        return self._rgb01ToHex(r1 + (r2 - r1) * t, g1 + (g2 - g1) * t, b1 + (b2 - b1) * t)
+
+    def _rgbDistance(self, c1, c2):
+        r1, g1, b1 = self._hexToRgb01(c1)
+        r2, g2, b2 = self._hexToRgb01(c2)
+        dr = (r1 - r2) * 255.0
+        dg = (g1 - g2) * 255.0
+        db = (b1 - b2) * 255.0
+        return (dr * dr + dg * dg + db * db) ** 0.5
+
+    def _stableInt(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        return int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16)
+
+    def _presetSpec(self, presetName):
+        p = str(presetName or "vibrant").strip().lower()
+        specs = {
+            "vibrant": {"sat": 0.78, "light": 0.52, "shade_span": 0.34},
+            "muted": {"sat": 0.48, "light": 0.56, "shade_span": 0.28},
+            "bold": {"sat": 0.88, "light": 0.48, "shade_span": 0.40},
+            "colorblind": {"sat": 0.68, "light": 0.50, "shade_span": 0.32},
+            "colorblind-safe": {"sat": 0.68, "light": 0.50, "shade_span": 0.32},
+            "classic": {"sat": 0.76, "light": 0.52, "shade_span": 0.30},
+            "default": {"sat": 0.78, "light": 0.52, "shade_span": 0.34},
+        }
+        return specs.get(p, specs["vibrant"])
+
+    def _autoBaseColor(self, key, presetName, usedBaseColors):
+        p = str(presetName or "vibrant").strip().lower()
+        if p == "classic":
+            classic_bases = [
+                "#3f8cff", "#10b981", "#f97316", "#e11d48",
+                "#8b5cf6", "#06b6d4", "#facc15", "#6366f1"
+            ]
+            return classic_bases[self._stableInt(key) % len(classic_bases)]
+
+        spec = self._presetSpec(presetName)
+        sat = self._clamp01(spec["sat"])
+        light = self._clamp01(spec["light"])
+        phi = 0.61803398875
+        seed = (self._stableInt(key) % 1000003) / 1000003.0
+
+        candidates = []
+        for i in range(36):
+            h = (seed + i * phi) % 1.0
+            jitter = (((self._stableInt(f"{key}:{i}") % 17) - 8) / 1000.0)
+            h = (h + jitter) % 1.0
+            r, g, b = colorsys.hls_to_rgb(h, light, sat)
+            candidates.append(self._rgb01ToHex(r, g, b))
+
+        if not usedBaseColors:
+            return candidates[0]
+
+        best = candidates[0]
+        bestMinDist = -1.0
+        for c in candidates:
+            minDist = min(self._rgbDistance(c, u) for u in usedBaseColors)
+            if minDist > bestMinDist:
+                bestMinDist = minDist
+                best = c
+            if minDist >= 90.0:
+                return c
+        return best
+
+    def _taskShadeFromGroupBase(self, baseHex, taskName, presetName):
+        p = str(presetName or "vibrant").strip().lower()
+        if p == "classic":
+            shades = [
+                baseHex,
+                self._mixHex(baseHex, "#ffffff", 0.24),
+                self._mixHex(baseHex, "#000000", 0.22),
+                self._mixHex(baseHex, "#ffffff", 0.38),
+            ]
+            return shades[self._stableInt(f"classic-shade:{taskName}") % len(shades)]
+
+        spec = self._presetSpec(presetName)
+        base_r, base_g, base_b = self._hexToRgb01(baseHex)
+        h, l, s = colorsys.rgb_to_hls(base_r, base_g, base_b)
+
+        # Deterministic but high-variance offsets, so tasks in the same group
+        # remain clearly distinct without requiring period-dependent ordering.
+        l_seed = (self._stableInt(f"shade-l:{taskName}") % 1000003) / 1000003.0 - 0.5
+        h_seed = (self._stableInt(f"shade-h:{taskName}") % 1000003) / 1000003.0 - 0.5
+        s_seed = (self._stableInt(f"shade-s:{taskName}") % 1000003) / 1000003.0 - 0.5
+
+        l_span = max(0.36, min(0.66, spec["shade_span"] + 0.30))
+        h_span = 0.30
+        s_span = 0.34
+
+        l2 = self._clamp01(max(0.16, min(0.90, l + l_seed * l_span)))
+        h2 = (h + h_seed * h_span) % 1.0
+        s2 = self._clamp01(max(0.22, min(0.98, s + s_seed * s_span)))
+
+        r, g, b = colorsys.hls_to_rgb(h2, l2, s2)
+        return self._rgb01ToHex(r, g, b)
+
+    def _deterministicBaseColor(self, key, presetName):
+        return self._autoBaseColor(key, presetName, [])
+
+    def _shadeSeries(self, baseHex, count, presetName):
+        count = max(1, int(count))
+        if count == 1:
+            return [baseHex]
+
+        spec = self._presetSpec(presetName)
+        base_r, base_g, base_b = self._hexToRgb01(baseHex)
+        h, l, s = colorsys.rgb_to_hls(base_r, base_g, base_b)
+        span = max(0.20, min(0.48, spec["shade_span"] + min(0.10, 0.01 * count)))
+        start = -span / 2.0
+        step = span / (count - 1)
+
+        shades = []
+        for i in range(count):
+            shift = start + i * step
+            li = self._clamp01(max(0.22, min(0.82, l + shift)))
+            si = self._clamp01(max(0.32, min(0.92, s + (0.05 if i % 2 == 0 else -0.05))))
+            hi = (h + ((i % 3) - 1) * 0.01) % 1.0 if count >= 7 else h
+            r, g, b = colorsys.hls_to_rgb(hi, li, si)
+            shades.append(self._rgb01ToHex(r, g, b))
+        return shades
+
+    def _applyColorSettingsFromSettings(self):
+        self.colorPalettePreset = str(self.settings.get("colorPalettePreset", "vibrant") or "vibrant")
+        self.selectedTaskUsesColor = bool(self.settings.get("selectedTaskUsesColor", True))
+        self.taskColorOverrides = self._normalizeColorMap(
+            self.settings.get("taskColorOverrides", self.settings.get("taskColors", {}))
+        )
+        self.groupColorOverrides = self._normalizeColorMap(
+            self.settings.get("groupColorOverrides", self.settings.get("groupColorBases", {}))
+        )
+
+    def _ensureColorSettingsConsistency(self):
+        self.settings["colorPalettePreset"] = self.colorPalettePreset
+        self.settings["selectedTaskUsesColor"] = bool(self.selectedTaskUsesColor)
+        self.settings["taskColorOverrides"] = dict(self.taskColorOverrides)
+        self.settings["groupColorOverrides"] = dict(self.groupColorOverrides)
+        # Backward-compatible aliases.
+        self.settings["taskColors"] = dict(self.taskColorOverrides)
+        self.settings["groupColorBases"] = dict(self.groupColorOverrides)
+
+    def buildTaskColorMap(self, taskHours=None, groupsOverride=None, taskColorOverrides=None, groupColorOverrides=None, presetName=None):
+        if not isinstance(taskHours, dict):
+            taskHours = {}
+
+        groupsMap = groupsOverride if isinstance(groupsOverride, dict) else (self.groups or {})
+        taskOverrides = self._normalizeColorMap(taskColorOverrides if taskColorOverrides is not None else self.taskColorOverrides)
+        groupOverrides = self._normalizeColorMap(groupColorOverrides if groupColorOverrides is not None else self.groupColorOverrides)
+        preset = presetName or self.colorPalettePreset or "vibrant"
+
+        taskNames = []
+        seen = set()
+        for name, hours in taskHours.items():
+            try:
+                hv = float(hours)
+            except Exception:
+                continue
+            if hv <= 0.0:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            taskNames.append(name)
+
+        groupToTasks = {}
+        for taskName in taskNames:
+            if taskName == "Untasked":
+                continue
+            grp = self._lookupGroupForTask(groupsMap, taskName)
+            if grp:
+                groupToTasks.setdefault(grp, []).append(taskName)
+
+        groupTaskColors = {}
+        for grp, tasks in groupToTasks.items():
+            groupBase = self._lookupOverrideColor(groupOverrides, grp) or self._deterministicBaseColor(
+                f"group:{self._canonicalKey(grp)}",
+                preset
+            )
+
+            ordered = sorted(tasks, key=lambda t: self._stableInt(f"group-order:{self._canonicalKey(grp)}:{self._canonicalKey(t)}"))
+            shades = self._shadeSeries(groupBase, len(ordered), preset)
+
+            for i, taskName in enumerate(ordered):
+                groupTaskColors[taskName] = shades[i]
+
+        result = {}
+        for taskName in taskNames:
+            if taskName == "Untasked":
+                result[taskName] = "#444c56"
+                continue
+
+            manualTask = self._lookupOverrideColor(taskOverrides, taskName)
+            if manualTask:
+                result[taskName] = manualTask
+                continue
+
+            if taskName in groupTaskColors:
+                result[taskName] = groupTaskColors[taskName]
+                continue
+
+            result[taskName] = self._deterministicBaseColor(
+                f"task:{self._canonicalKey(taskName)}",
+                preset
+            )
+
+        return result
+
+
+    def getTaskDisplayColor(self, taskName):
+        if taskName == "Untasked":
+            return "#444c56"
+        colorMap = self.buildTaskColorMap({taskName: 1.0})
+        return colorMap.get(taskName, self.accentColor)
+
+    def _renameSummaryTaskLabel(self, summaryText, oldName, newName):
+        if not isinstance(summaryText, str) or not summaryText:
+            return summaryText, False
+
+        changed = False
+        out = []
+        for line in summaryText.splitlines():
+            if ":" not in line:
+                out.append(line)
+                continue
+            left, right = line.split(":", 1)
+            if left.strip() != oldName:
+                out.append(line)
+                continue
+
+            lead_ws_len = len(left) - len(left.lstrip())
+            trail_ws_len = len(left) - len(left.rstrip())
+            lead = left[:lead_ws_len]
+            trail = left[len(left) - trail_ws_len:] if trail_ws_len > 0 else ""
+            out.append(f"{lead}{newName}{trail}:{right}")
+            changed = True
+
+        newText = "\n".join(out)
+        if summaryText.endswith("\n"):
+            newText += "\n"
+        return newText, changed
+
+    def _renameTaskInHistory(self, oldName, newName):
+        changed = False
+        for dayKey, entry in list(self.history.items()):
+            if isinstance(entry, dict):
+                entryChanged = False
+                summary = entry.get("summary", "") or ""
+                newSummary, summaryChanged = self._renameSummaryTaskLabel(summary, oldName, newName)
+                if summaryChanged:
+                    entry["summary"] = newSummary
+                    entryChanged = True
+
+                timeline = entry.get("timeline", []) or []
+                timelineChanged = False
+                for seg in timeline:
+                    if isinstance(seg, dict) and seg.get("task") == oldName:
+                        seg["task"] = newName
+                        timelineChanged = True
+                if timelineChanged:
+                    entry["timeline"] = timeline
+                    entryChanged = True
+
+                if entryChanged:
+                    self.history[dayKey] = entry
+                    changed = True
+            elif isinstance(entry, str):
+                newSummary, summaryChanged = self._renameSummaryTaskLabel(entry, oldName, newName)
+                if summaryChanged:
+                    self.history[dayKey] = newSummary
+                    changed = True
+        return changed
+
+    def renameTask(self, oldName, newName, persist=True):
+        oldName = (oldName or "").strip()
+        newName = (newName or "").strip()
+        if not oldName or not newName:
+            return False, "Task name is required."
+        if oldName == newName:
+            return True, ""
+        if oldName not in self.rows:
+            return False, f"Task '{oldName}' does not exist."
+        if newName in self.rows:
+            return False, f"Task '{newName}' already exists."
+
+        names = list(self.rows.keys())
+        newOrder = [newName if n == oldName else n for n in names]
+
+        priorTasks = dict(self.tasks)
+        movedSeconds = priorTasks.get(oldName, 0.0)
+        if oldName in priorTasks:
+            del priorTasks[oldName]
+        priorTasks[newName] = movedSeconds
+
+        groupKey = oldName if oldName in self.groups else None
+        if groupKey is None:
+            for k in list(self.groups.keys()):
+                if self._canonicalKey(k) == self._canonicalKey(oldName):
+                    groupKey = k
+                    break
+        if groupKey is not None:
+            self.groups[newName] = self.groups.pop(groupKey)
+
+        if self.currentTask == oldName:
+            self.currentTask = newName
+
+        for seg in self.dayTimeline:
+            if isinstance(seg, dict) and seg.get("task") == oldName:
+                seg["task"] = newName
+
+        overrideKey = oldName if oldName in self.taskColorOverrides else None
+        if overrideKey is None:
+            for k in list(self.taskColorOverrides.keys()):
+                if self._canonicalKey(k) == self._canonicalKey(oldName):
+                    overrideKey = k
+                    break
+        if overrideKey is not None:
+            self.taskColorOverrides[newName] = self.taskColorOverrides.pop(overrideKey)
+
+        self._renameTaskInHistory(oldName, newName)
+        self._ensureColorSettingsConsistency()
+
+        for rowFrame, _, timeLabel, _ in self.rows.values():
+            try:
+                rowFrame.destroy()
+            except Exception:
+                pass
+            try:
+                timeLabel.destroy()
+            except Exception:
+                pass
+
+        self.rows = {}
+        self.tasks = {}
+        for n in newOrder:
+            self.tasks[n] = float(priorTasks.get(n, 0.0))
+            self.createTaskRow(n)
+
+        self.relayoutRows()
+        self.refreshRowStyles()
+        if persist:
+            if not self.rewrite_data_file():
+                self.saveData()
+        return True, ""
 
     def _getPosting(self, showToast=False):
         if self._posting is not None:
@@ -218,6 +652,16 @@ class TaskTrackerApp:
             bg=self.bgColor
         )
         subtitle.grid(row=2, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
+
+        self.sessionStatusLabel = tk.Label(
+            self.root,
+            text="Status: Idle · Total 0.0h",
+            font=("Segoe UI", 9),
+            fg="#9ca3af",
+            bg=self.bgColor,
+            anchor="w"
+        )
+        self.sessionStatusLabel.grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 2), sticky="we")
 
         self.newTaskEntry = tk.Entry(
             self.root,
@@ -327,6 +771,24 @@ class TaskTrackerApp:
         
         self.toastTimer = self.root.after(timeout, dismissToast)
 
+    def _setBusy(self, active=True):
+        if active:
+            self._busyCount += 1
+        else:
+            self._busyCount = max(0, self._busyCount - 1)
+
+        cursor = "wait" if self._busyCount > 0 else ""
+        try:
+            self.root.config(cursor=cursor)
+            for w in self.root.winfo_children():
+                try:
+                    w.config(cursor=cursor)
+                except Exception:
+                    pass
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
     def _styleButton(self, btn, hover_bg=None):
         normal_bg = btn.cget("bg")
         hover = hover_bg or btn.cget("activebackground") or normal_bg
@@ -335,11 +797,14 @@ class TaskTrackerApp:
         btn.bind("<Leave>", lambda e: btn.config(bg=normal_bg), add="+")
 
     def _bindTaskRowHover(self, taskName, rowFrame, nameLabel, deleteBtn, handleLabel, timeLabel):
-        hover_bg = "#262c33"
-
         def apply_hover():
             if self.dragTaskName is not None or self.currentTask == taskName:
                 return
+            try:
+                taskColor = self.getTaskDisplayColor(taskName)
+                hover_bg = self._mixHex(self.cardColor, taskColor, 0.08)
+            except Exception:
+                hover_bg = "#262c33"
             rowFrame.config(bg=hover_bg)
             nameLabel.config(bg=hover_bg)
             deleteBtn.config(bg=hover_bg)
@@ -518,6 +983,85 @@ class TaskTrackerApp:
                 pass
             return
 
+    def rewrite_data_file(self):
+        desired_tasks = list(self.rows.keys())
+        desired_groups = dict(self.groups or {})
+
+        dirpath = os.path.dirname(self.realPath) or self.getDataDir()
+        try:
+            os.makedirs(dirpath, exist_ok=True)
+        except Exception:
+            pass
+
+        preserved_chargeCodes = []
+        preserved_other = []
+
+        if os.path.exists(self.realPath):
+            try:
+                with open(self.realPath, "r", encoding="utf-8") as rf:
+                    for raw in rf:
+                        line = raw.rstrip("\n")
+                        if not line.strip():
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            preserved_other.append(line.strip())
+                            continue
+                        t = obj.get("type")
+                        if t == "chargeCode":
+                            preserved_chargeCodes.append(obj)
+                        elif t in ("task", "group", "history"):
+                            continue
+                        else:
+                            preserved_other.append(line.strip())
+            except Exception:
+                return False
+
+        history_items = []
+        for dayKey in sorted(self.history.keys()):
+            entry = self.history.get(dayKey)
+            if isinstance(entry, dict):
+                summary = entry.get("summary", "") or ""
+                timeline = entry.get("timeline", []) or []
+            else:
+                summary = entry or ""
+                timeline = []
+            history_items.append({
+                "type": "history",
+                "date": dayKey,
+                "summary": summary,
+                "timeline": timeline
+            })
+
+        tmp = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, dir=dirpath)
+            for name in desired_tasks:
+                tmp.write(json.dumps({"type": "task", "name": name}, ensure_ascii=False, separators=(',',':')) + "\n")
+            for t, g in desired_groups.items():
+                tmp.write(json.dumps({"type": "group", "task": t, "group": g}, ensure_ascii=False, separators=(',',':')) + "\n")
+            for obj in preserved_chargeCodes:
+                tmp.write(json.dumps(obj, ensure_ascii=False, separators=(',',':')) + "\n")
+            for obj in history_items:
+                tmp.write(json.dumps(obj, ensure_ascii=False, separators=(',',':')) + "\n")
+            for line in preserved_other:
+                tmp.write(line + "\n")
+            tmp.flush()
+            tmp.close()
+            os.replace(tmp.name, self.realPath)
+            self.dataFile = self.realPath
+            return True
+        except Exception:
+            try:
+                if tmp is not None:
+                    tmp.close()
+                    if os.path.exists(tmp.name):
+                        os.remove(tmp.name)
+            except Exception:
+                pass
+            return False
+
     def append_history_entry(self, dateKey, entry):
         dirpath = os.path.dirname(self.realPath) or self.getDataDir()
         try:
@@ -608,9 +1152,9 @@ class TaskTrackerApp:
 
     def adjustWindowHeight(self):
         self.root.update_idletasks()
-        width = self.baseWidth
-        count = len(self.rows)
-        height = self.baseHeight + self.rowHeight * count + 20
+        # Keep runtime resizing consistent with initial load sizing logic.
+        width = max(int(self.baseWidth), int(self.root.winfo_reqwidth()))
+        height = int(self.root.winfo_reqheight())
         self.root.geometry(f"{width}x{height}")
 
     def createTaskRow(self, name):
@@ -822,6 +1366,7 @@ class TaskTrackerApp:
 
         def _punchInThread():
             try:
+                self.root.after(0, lambda: self.showToast("Clocking in…", timeout=1500))
                 posting = self._getPosting(showToast=True)
                 if posting is None:
                     return
@@ -862,6 +1407,8 @@ class TaskTrackerApp:
         
         def _punchOutThread():
             try:
+                self.root.after(0, lambda: self._setBusy(True))
+                self.root.after(0, lambda: self.showToast("Clocking out…", timeout=1500))
                 posting = self._getPosting(showToast=True)
                 if posting is None:
                     return
@@ -899,6 +1446,8 @@ class TaskTrackerApp:
                 
             except Exception as e:
                 self._punchOutSuccess = False
+            finally:
+                self.root.after(0, lambda: self._setBusy(False))
         
         thread = threading.Thread(target=_punchOutThread, daemon=True)
         thread.start()
@@ -908,8 +1457,34 @@ class TaskTrackerApp:
         if not self.autoChargeCodes:
             return
 
+        chargeCodesByKey = self.loadChargeCodesFromJsonl()
+        if not chargeCodesByKey:
+            self.showToast("No charge codes found", error=True)
+            return
+
+        if dateKey:
+            try:
+                dateStr = datetime.strptime(dateKey, "%Y-%m-%d").strftime("%m/%d/%Y")
+            except Exception:
+                dateStr = date.today().strftime("%m/%d/%Y")
+        else:
+            dateStr = date.today().strftime("%m/%d/%Y")
+
+        plan = self._buildChargeCodePostingPlan(taskSecondsSnapshot, chargeCodesByKey)
+        roundedTaskHours = dict(plan.get("roundedTaskHours", {}))
+        if not roundedTaskHours:
+            self.showToast("No task time to post")
+            return
+
+        if bool(getattr(self, "reviewBeforePost", False)):
+            if not self._confirmChargeCodeReview(plan, dateStr):
+                self.showToast("Charge code posting canceled")
+                return
+
         def job():
             try:
+                self.root.after(0, lambda: self._setBusy(True))
+                self.root.after(0, lambda: self.showToast("Posting charge codes…", timeout=1500))
                 posting = self._getPosting(showToast=True)
                 if posting is None:
                     return
@@ -921,56 +1496,16 @@ class TaskTrackerApp:
                     self.showToast("Session not ready", error=True)
                     return
 
-                chargeCodesByKey = self.loadChargeCodesFromJsonl()
-                if not chargeCodesByKey:
-                    self.showToast("No charge codes found", error=True)
-                    return
-
-                if dateKey:
-                    try:
-                        dateStr = datetime.strptime(dateKey, "%Y-%m-%d").strftime("%m/%d/%Y")
-                    except Exception:
-                        dateStr = date.today().strftime("%m/%d/%Y")
-                else:
-                    dateStr = date.today().strftime("%m/%d/%Y")
-
-                if isinstance(taskSecondsSnapshot, dict):
-                    taskSeconds = dict(taskSecondsSnapshot)
-                else:
-                    taskSeconds = dict(self.tasks)
-                    if self.currentTask and self.currentStart:
-                        now = time.time()
-                        taskSeconds[self.currentTask] = (
-                            taskSeconds.get(self.currentTask, 0.0) + (now - self.currentStart)
-                        )
-                    if self.unassignedSeconds > 0:
-                        taskSeconds["Untasked"] = (
-                            taskSeconds.get("Untasked", 0.0) + self.unassignedSeconds
-                        )
-
-                hoursByKey = {key: 0.0 for key in chargeCodesByKey.keys()}
-
-                for taskName, seconds in taskSeconds.items():
-                    hours = round((seconds / 3600.0), 1)
-
-                    if taskName in chargeCodesByKey:
-                        hoursByKey[taskName] += hours
-                    else:
-                        groupName = self.groups.get(taskName)
-                        if groupName in chargeCodesByKey:
-                            hoursByKey[groupName] += hours
-
-                # Normalize totals to match the rounded actual elapsed time.
-                target_total = round(sum(taskSeconds.values()) / 3600.0, 1)
-                current_total = round(sum(hoursByKey.values()), 1)
-                diff = round(target_total - current_total, 1)
-                if abs(diff) >= 0.05 and hoursByKey:
-                    # Adjust the largest bucket to keep totals aligned.
-                    max_key = max(hoursByKey.items(), key=lambda kv: kv[1])[0]
-                    hoursByKey[max_key] = round(hoursByKey[max_key] + diff, 1)
+                chargeCodesByKey = dict(plan.get("chargeCodesByKey", {}))
+                hoursByKey = dict(plan.get("hoursByKey", {}))
+                unmappedHours = float(plan.get("unmappedTotal", 0.0))
+                targetTotal = float(plan.get("targetTotal", 0.0))
 
                 hadError = False
                 for key, hours in hoursByKey.items():
+                    if hours <= 0:
+                        continue
+                    hoursPayload = float(f"{hours:.1f}")
                     try:
                         posting.postHoursWorked(
                             self.punchSession,
@@ -978,18 +1513,28 @@ class TaskTrackerApp:
                             self.timesheetId,
                             chargeCodesByKey[key],
                             dateStr,
-                            hours
+                            hoursPayload
                         )
                     except Exception:
                         hadError = True
 
+                mappedTotal = round(sum(hoursByKey.values()), 1)
+
                 if hadError:
                     self.showToast("Posted charge codes (some failed)", error=True)
+                elif unmappedHours > 0:
+                    self.showToast(
+                        f"Posted {mappedTotal:.1f}h charge codes ({unmappedHours:.1f}h unmapped, day total {targetTotal:.1f}h)",
+                        timeout=5000,
+                        error=True
+                    )
                 else:
                     self.showToast("Successfully posted charge codes")
 
             except Exception:
                 self.showToast("Error posting charge codes", error=True)
+            finally:
+                self.root.after(0, lambda: self._setBusy(False))
 
         threading.Thread(target=job, daemon=True).start()
 
@@ -1083,6 +1628,22 @@ class TaskTrackerApp:
         self.relayoutRows()
 
     def onClose(self):
+        if self.hasUnsavedTime:
+            closeChoice = messagebox.askyesnocancel(
+                "Exit Task Tracker",
+                "You have unsaved time.\n\n"
+                "Yes: Save and post before exiting.\n"
+                "No: Exit without saving/posting.\n"
+                "Cancel: Keep the app open."
+            )
+            if closeChoice is None:
+                return
+            if closeChoice is False:
+                self.hasUnsavedTime = False
+                self.dayTimeline = []
+                self.root.destroy()
+                return
+
         now = time.time()
 
         self._closeActiveSegment(now)
@@ -1266,15 +1827,32 @@ class TaskTrackerApp:
                 bg = "#2a2f37"
                 bd = 2
                 relief = "raised"
+                hi = "#6b7280"
+                hi_t = 1
             elif name == self.currentTask:
-                bg = self.activeColor
+                if bool(self.selectedTaskUsesColor):
+                    taskColor = self.getTaskDisplayColor(name)
+                    bg = self._mixHex(self.cardColor, taskColor, 0.20)
+                else:
+                    bg = self.activeColor
                 bd = 0
                 relief = "flat"
+                hi = bg
+                hi_t = 0
             else:
                 bg = self.cardColor
                 bd = 0
                 relief = "flat"
-            rowFrame.config(bg=bg, bd=bd, relief=relief)
+                hi = self.cardColor
+                hi_t = 0
+            rowFrame.config(
+                bg=bg,
+                bd=bd,
+                relief=relief,
+                highlightthickness=hi_t,
+                highlightbackground=hi,
+                highlightcolor=hi
+            )
             nameLabel.config(bg=bg)
             deleteBtn.config(bg=bg)
 
@@ -1300,6 +1878,11 @@ class TaskTrackerApp:
         del self.rows[name]
         if name in self.tasks:
             del self.tasks[name]
+        if name in self.groups:
+            del self.groups[name]
+        if name in self.taskColorOverrides:
+            del self.taskColorOverrides[name]
+            self._ensureColorSettingsConsistency()
 
         self.relayoutRows()
         self.saveData()
@@ -1325,6 +1908,7 @@ class TaskTrackerApp:
             if name in self.rows:
                 _, _, timeLabel, _ = self.rows[name]
                 timeLabel.config(text=text)
+        self._updateSessionStatusStrip()
         self.root.after(50, self.updateLoop)
 
     def _parseSummaryText(self, text):
@@ -1358,21 +1942,265 @@ class TaskTrackerApp:
             grouped[group] = grouped.get(group, 0.0) + hours
         return grouped
 
+    def _collectTaskSecondsSnapshot(self):
+        taskSeconds = dict(self.tasks)
+        now = time.time()
+
+        if self.currentTask and self.currentStart is not None:
+            taskSeconds[self.currentTask] = (
+                taskSeconds.get(self.currentTask, 0.0) + max(0.0, now - self.currentStart)
+            )
+
+        if self.unassignedStart is not None:
+            taskSeconds["Untasked"] = (
+                taskSeconds.get("Untasked", 0.0) + max(0.0, now - self.unassignedStart)
+            )
+
+        if self.unassignedSeconds > 0:
+            taskSeconds["Untasked"] = (
+                taskSeconds.get("Untasked", 0.0) + self.unassignedSeconds
+            )
+
+        return taskSeconds
+
+    def _buildChargeCodePostingPlan(self, taskSecondsSnapshot=None, chargeCodesByKey=None):
+        if isinstance(taskSecondsSnapshot, dict):
+            taskSeconds = dict(taskSecondsSnapshot)
+        else:
+            taskSeconds = self._collectTaskSecondsSnapshot()
+
+        roundedTaskHours, targetTotal = self._normalizeRoundedHours(taskSeconds)
+
+        if chargeCodesByKey is None:
+            chargeCodesByKey = self.loadChargeCodesFromJsonl()
+        chargeCodesByKey = chargeCodesByKey or {}
+
+        canonicalChargeKey = {
+            self._canonicalKey(key): key for key in chargeCodesByKey.keys()
+        }
+
+        hoursByKey = {key: 0.0 for key in chargeCodesByKey.keys()}
+        unmappedByTask = {}
+
+        for taskName, hours in roundedTaskHours.items():
+            chargeKey = canonicalChargeKey.get(self._canonicalKey(taskName))
+            if chargeKey is None:
+                groupName = self._lookupGroupForTask(self.groups, taskName)
+                if groupName:
+                    chargeKey = canonicalChargeKey.get(self._canonicalKey(groupName))
+
+            if chargeKey is None:
+                unmappedByTask[taskName] = round(unmappedByTask.get(taskName, 0.0) + hours, 1)
+                continue
+
+            hoursByKey[chargeKey] = round(hoursByKey.get(chargeKey, 0.0) + hours, 1)
+
+        mappedTotal = round(sum(hoursByKey.values()), 1)
+        unmappedTotal = round(sum(unmappedByTask.values()), 1)
+
+        return {
+            "taskSeconds": taskSeconds,
+            "roundedTaskHours": roundedTaskHours,
+            "targetTotal": round(targetTotal, 1),
+            "chargeCodesByKey": chargeCodesByKey,
+            "hoursByKey": hoursByKey,
+            "mappedTotal": mappedTotal,
+            "unmappedByTask": unmappedByTask,
+            "unmappedTotal": unmappedTotal,
+        }
+
+    def _getChargeCodesCached(self, maxAgeSeconds=5.0):
+        now = time.time()
+        if now - float(self._cachedChargeCodesTs or 0.0) > float(maxAgeSeconds):
+            self._cachedChargeCodesByKey = self.loadChargeCodesFromJsonl() or {}
+            self._cachedChargeCodesTs = now
+        return dict(self._cachedChargeCodesByKey or {})
+
+    def _confirmChargeCodeReview(self, plan, dateStr):
+        hoursByKey = dict(plan.get("hoursByKey", {}))
+        unmappedByTask = dict(plan.get("unmappedByTask", {}))
+        targetTotal = float(plan.get("targetTotal", 0.0))
+        mappedTotal = float(plan.get("mappedTotal", 0.0))
+        unmappedTotal = float(plan.get("unmappedTotal", 0.0))
+
+        lines = [
+            f"Date: {dateStr}",
+            f"Rounded day total: {targetTotal:.1f} h",
+            f"Mapped: {mappedTotal:.1f} h",
+            f"Unmapped: {unmappedTotal:.1f} h",
+            "",
+            "Charge code posting:",
+        ]
+
+        for key, hours in sorted(hoursByKey.items(), key=lambda kv: kv[0].lower()):
+            if hours <= 0:
+                continue
+            lines.append(f"  {key}: {hours:.1f} h")
+
+        if unmappedByTask:
+            lines.append("")
+            lines.append("Unmapped tasks:")
+            for task, hours in sorted(unmappedByTask.items(), key=lambda kv: kv[0].lower()):
+                lines.append(f"  {task}: {hours:.1f} h")
+
+        lines.append("")
+        lines.append("Post charge codes now?")
+        return messagebox.askyesno("Review Charge Codes", "\n".join(lines))
+
+    def _updateSessionStatusStrip(self):
+        if not hasattr(self, "sessionStatusLabel"):
+            return
+
+        now = time.time()
+        if now < float(self._nextStatusRefreshTs or 0.0):
+            return
+        self._nextStatusRefreshTs = now + 0.8
+
+        snapshot = self._collectTaskSecondsSnapshot()
+        _, totalRounded = self._normalizeRoundedHours(snapshot)
+
+        if self.currentTask and self.currentStart is not None:
+            mode = f"Active"
+        elif self.unassignedStart is not None:
+            mode = "Active - Untasked"
+        else:
+            mode = "Idle"
+
+        text = f"Status: {mode} · Total {totalRounded:.1f}h"
+        fg = "#9ca3af"
+
+        if self.autoChargeCodes:
+            chargeCodesByKey = self._getChargeCodesCached(maxAgeSeconds=5.0)
+            if chargeCodesByKey:
+                plan = self._buildChargeCodePostingPlan(snapshot, chargeCodesByKey)
+                unmapped = float(plan.get("unmappedTotal", 0.0))
+                if unmapped > 0:
+                    text += f" · Unmapped {unmapped:.1f}h"
+                    fg = "#ffae7a"
+                else:
+                    text += " · All mapped"
+            else:
+                text += " · No charge codes loaded"
+                fg = "#ffae7a"
+
+        try:
+            self.sessionStatusLabel.config(text=text, fg=fg)
+        except Exception:
+            pass
+
     def _normalizeRoundedHours(self, secondsByTask):
-        if not secondsByTask:
+        if not isinstance(secondsByTask, dict) or not secondsByTask:
             return {}, 0.0
-        raw_total_hours = sum(secondsByTask.values()) / 3600.0
-        target_total = round(raw_total_hours, 1)
-        rounded = {t: round(sec / 3600.0, 1) for t, sec in secondsByTask.items()}
-        current_total = round(sum(rounded.values()), 1)
-        diff = round(target_total - current_total, 1)
-        if abs(diff) >= 0.05:
-            for name, _ in sorted(rounded.items(), key=lambda kv: kv[1], reverse=True):
-                new_val = round(rounded[name] + diff, 1)
-                if new_val >= 0:
-                    rounded[name] = new_val
+
+        rawHours = {}
+        for name, seconds in secondsByTask.items():
+            try:
+                secVal = float(seconds)
+            except Exception:
+                continue
+            if secVal <= 0:
+                continue
+            rawHours[name] = secVal / 3600.0
+
+        if not rawHours:
+            return {}, 0.0
+
+        targetTenths = int(round(sum(rawHours.values()) * 10.0))
+        if targetTenths <= 0:
+            return {}, 0.0
+
+        nearestTenths = {name: int(round(hours * 10.0)) for name, hours in rawHours.items()}
+
+        minTenths = {name: 1 for name in rawHours.keys()}
+        # If there are too many tiny tasks to honor a 0.1 floor for all, relax
+        # smallest ones (prefer Untasked) down to 0.0 so totals can reconcile.
+        if targetTenths < len(rawHours):
+            overflow = len(rawHours) - targetTenths
+            relaxOrder = sorted(
+                rawHours.items(),
+                key=lambda kv: (0 if kv[0] == "Untasked" else 1, kv[1], kv[0].lower())
+            )
+            for idx, (name, _) in enumerate(relaxOrder):
+                if idx >= overflow:
                     break
-        return rounded, target_total
+                minTenths[name] = 0
+
+        alloc = {name: max(minTenths[name], nearestTenths[name]) for name in rawHours.keys()}
+
+        def reduceChoice(withinOne):
+            candidates = []
+            for name in alloc.keys():
+                if alloc[name] <= minTenths[name]:
+                    continue
+                if withinOne and abs((alloc[name] - 1) - nearestTenths[name]) > 1:
+                    continue
+                rawTenths = rawHours[name] * 10.0
+                afterErr = abs((alloc[name] - 1) - rawTenths)
+                candidates.append((
+                    0 if name == "Untasked" else 1,  # prefer reducing Untasked first
+                    afterErr,                         # then minimize error from raw
+                    -alloc[name],                    # then take larger buckets
+                    name.lower(),
+                    name
+                ))
+            if not candidates:
+                return None
+            candidates.sort()
+            return candidates[0][-1]
+
+        def increaseChoice(withinOne):
+            candidates = []
+            for name in alloc.keys():
+                if withinOne and abs((alloc[name] + 1) - nearestTenths[name]) > 1:
+                    continue
+                rawTenths = rawHours[name] * 10.0
+                afterErr = abs((alloc[name] + 1) - rawTenths)
+                candidates.append((
+                    1 if name == "Untasked" else 0,  # avoid inflating Untasked when possible
+                    afterErr,                         # then minimize error from raw
+                    name.lower(),
+                    name
+                ))
+            if not candidates:
+                return None
+            candidates.sort()
+            return candidates[0][-1]
+
+        diff = targetTenths - sum(alloc.values())
+        guard = 0
+        while diff < 0 and guard < 20000:
+            pick = reduceChoice(withinOne=True) or reduceChoice(withinOne=False)
+            if pick is None:
+                break
+            alloc[pick] -= 1
+            diff += 1
+            guard += 1
+
+        guard = 0
+        while diff > 0 and guard < 20000:
+            pick = increaseChoice(withinOne=True) or increaseChoice(withinOne=False)
+            if pick is None:
+                break
+            alloc[pick] += 1
+            diff -= 1
+            guard += 1
+
+        # Final safety: if negative diff remains, relax floors further.
+        if diff < 0:
+            relaxOrder = sorted(
+                rawHours.items(),
+                key=lambda kv: (0 if kv[0] == "Untasked" else 1, kv[1], kv[0].lower())
+            )
+            for name, _ in relaxOrder:
+                while diff < 0 and alloc.get(name, 0) > 0:
+                    alloc[name] -= 1
+                    diff += 1
+                if diff >= 0:
+                    break
+
+        rounded = {name: round(tenths / 10.0, 1) for name, tenths in alloc.items() if tenths > 0}
+        targetTotal = round(targetTenths / 10.0, 1)
+        return rounded, targetTotal
 
     def _mergeSummaryForDate(self, dateKey, newSummary, allowSkip=False):
         existingEntry = self.history.get(dateKey)
@@ -1673,11 +2501,7 @@ if __name__ == "__main__":
     root.withdraw()
 
     app = TaskTrackerApp(root)
-
-    root.update_idletasks()
-    w = max(app.baseWidth, root.winfo_reqwidth())
-    h = root.winfo_reqheight()
-    root.geometry(f"{w}x{h}")
+    app.adjustWindowHeight()
 
     root.deiconify()
     root.mainloop()
