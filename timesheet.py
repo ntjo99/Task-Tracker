@@ -117,6 +117,8 @@ class TaskTrackerApp:
         self._nextStatusRefreshTs = 0.0
         self._cachedChargeCodesByKey = {}
         self._cachedChargeCodesTs = 0.0
+        self._pendingChargePost = None
+        self._pendingChargePostLock = threading.Lock()
 
         self.validateEnvFile()
 
@@ -1453,6 +1455,30 @@ class TaskTrackerApp:
         thread.start()
         return thread
 
+    def _postAfterPunchOut(self, taskSecondsSnapshot):
+        punchThread = self.punchOut()
+        if not punchThread:
+            self._queueChargeCodePost(taskSecondsSnapshot)
+            return
+
+        def _waitAndPost():
+            try:
+                punchThread.join()
+            except Exception:
+                pass
+
+            self._queueChargeCodePost(taskSecondsSnapshot)
+
+        threading.Thread(target=_waitAndPost, daemon=True).start()
+
+    def _queueChargeCodePost(self, taskSecondsSnapshot):
+        snapshot = dict(taskSecondsSnapshot or {})
+        try:
+            with self._pendingChargePostLock:
+                self._pendingChargePost = snapshot
+        except Exception:
+            self._pendingChargePost = snapshot
+
     def postChargeCodeHours(self, taskSecondsSnapshot=None, dateKey=None):
         if not self.autoChargeCodes:
             return
@@ -1658,26 +1684,12 @@ class TaskTrackerApp:
         self.stopUnassigned(now)
 
         if self.hasUnsavedTime:
-            taskSecondsForSummary = dict(self.tasks)
-            if self.unassignedSeconds > 0:
-                taskSecondsForSummary["Untasked"] = (
-                    taskSecondsForSummary.get("Untasked", 0.0) + self.unassignedSeconds
-                )
-
-            roundedHours, totalHours = self._normalizeRoundedHours(taskSecondsForSummary)
-            lines = []
-            for name, hours in sorted(roundedHours.items(), key=lambda kv: kv[0].lower()):
-                lines.append(f"{name}: {hours:.1f} h")
-            lines.append(f"Total: {totalHours:.1f} h")
-            summary = "\n".join(lines)
-
             todayKey = date.today().isoformat()
-            merged, choice = self._mergeSummaryForDate(todayKey, summary, allowSkip=True)
-
-            if merged is None or choice == "cancel":
+            choice = self._chooseMergeActionForDate(todayKey, allowSkip=True)
+            if choice == "cancel":
                 return
 
-            if merged == "__SKIP__" or choice == "skip":
+            if choice == "skip":
                 self.hasUnsavedTime = False
                 self.dayTimeline = []
                 self.root.destroy()
@@ -1694,6 +1706,8 @@ class TaskTrackerApp:
                 timeline = list(self.dayTimeline)
 
             timeline = self._roundTimelineEdgesToHour(timeline)
+            taskSecondsSnapshot = self._collectTaskSecondsFromTimeline(timeline)
+            merged = self._buildSummaryFromTaskSeconds(taskSecondsSnapshot)
 
             self.history[todayKey] = {
                 "summary": merged,
@@ -1701,27 +1715,6 @@ class TaskTrackerApp:
             }
             # append only the day's summary to the jsonl log
             self.append_history_entry(todayKey, self.history[todayKey])
-
-            taskSecondsSnapshot = dict(self.tasks)
-            if self.currentTask and self.currentStart:
-                now2 = time.time()
-                taskSecondsSnapshot[self.currentTask] = (
-                    taskSecondsSnapshot.get(self.currentTask, 0.0) + (now2 - self.currentStart)
-                )
-
-            if choice == "append" and existingEntry:
-                if isinstance(existingEntry, dict):
-                    existingText = existingEntry.get("summary", "") or ""
-                else:
-                    existingText = existingEntry or ""
-                oldAgg, _ = self._parseSummaryText(existingText)
-                for name, hours in oldAgg.items():
-                    taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
-
-            if self.unassignedSeconds > 0:
-                taskSecondsSnapshot["Untasked"] = (
-                    taskSecondsSnapshot.get("Untasked", 0.0) + self.unassignedSeconds
-                )
             
             # Punch out when closing with unsaved time
             punchThread = self.punchOut()
@@ -1892,6 +1885,19 @@ class TaskTrackerApp:
             self.deleteTaskPrompt(self.currentTask)
 
     def updateLoop(self):
+        pendingPost = None
+        try:
+            with self._pendingChargePostLock:
+                if self._pendingChargePost is not None:
+                    pendingPost = self._pendingChargePost
+                    self._pendingChargePost = None
+        except Exception:
+            pendingPost = self._pendingChargePost
+            self._pendingChargePost = None
+
+        if pendingPost is not None:
+            self.postChargeCodeHours(pendingPost)
+
         for name, baseSeconds in self.tasks.items():
             extra = 0.0
             if name == self.currentTask and self.currentStart is not None:
@@ -1911,27 +1917,70 @@ class TaskTrackerApp:
         self._updateSessionStatusStrip()
         self.root.after(50, self.updateLoop)
 
-    def _parseSummaryText(self, text):
+    def _collectTaskSecondsFromTimeline(self, timeline):
         agg = {}
-        total = 0.0
-        for line in text.splitlines():
-            if ":" not in line:
+        if not isinstance(timeline, list):
+            return agg
+
+        for seg in timeline:
+            if not isinstance(seg, dict):
                 continue
-            name, rest = line.split(":", 1)
-            name = name.strip()
-            rest = rest.strip()
-            if not rest:
+            taskName = str(seg.get("task", "")).strip()
+            if not taskName:
                 continue
-            token = rest.split()[0]
             try:
-                hours = float(token)
-            except ValueError:
+                startDt = datetime.fromisoformat(seg.get("start", ""))
+                endDt = datetime.fromisoformat(seg.get("end", ""))
+            except Exception:
                 continue
-            if name.lower() == "total":
+            duration = (endDt - startDt).total_seconds()
+            if duration <= 0:
                 continue
-            agg[name] = agg.get(name, 0.0) + hours
-            total += hours
-        return agg, total
+            agg[taskName] = agg.get(taskName, 0.0) + duration
+
+        return agg
+
+    def _buildSummaryFromTaskSeconds(self, taskSeconds):
+        roundedHours, totalHours = self._normalizeRoundedHours(taskSeconds)
+        lines = []
+        for name, hours in sorted(roundedHours.items(), key=lambda kv: kv[0].lower()):
+            lines.append(f"{name}: {hours:.1f} h")
+        lines.append(f"Total: {totalHours:.1f} h")
+        return "\n".join(lines)
+
+    def _chooseMergeActionForDate(self, dateKey, allowSkip=False):
+        existingEntry = self.history.get(dateKey)
+        if not existingEntry:
+            return "new"
+
+        if allowSkip:
+            choice = messagebox.askyesnocancel(
+                "Existing summary",
+                "A summary already exists for this date.\n\n"
+                "Yes: Append\n"
+                "No: Overwrite\n"
+                "Cancel: More options"
+            )
+            if choice is None:
+                skipChoice = messagebox.askyesno(
+                    "Close without saving",
+                    "Close without saving this summary?"
+                )
+                if skipChoice:
+                    return "skip"
+                return "cancel"
+        else:
+            choice = messagebox.askyesnocancel(
+                "Existing summary",
+                "A summary already exists for this date.\n\n"
+                "Yes: Append\n"
+                "No: Overwrite\n"
+                "Cancel: Keep existing summary"
+            )
+            if choice is None:
+                return "cancel"
+
+        return "append" if choice else "overwrite"
 
     def _groupAggregates(self, taskAgg):
         grouped = {}
@@ -2202,158 +2251,6 @@ class TaskTrackerApp:
         targetTotal = round(targetTenths / 10.0, 1)
         return rounded, targetTotal
 
-    def _mergeSummaryForDate(self, dateKey, newSummary, allowSkip=False):
-        existingEntry = self.history.get(dateKey)
-        if not existingEntry:
-            return newSummary, "new"
-
-        if isinstance(existingEntry, dict):
-            existingText = existingEntry.get("summary", "") or ""
-        else:
-            existingText = existingEntry or ""
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Existing summary")
-        dialog.configure(bg=self.bgColor)
-        dialog.resizable(False, False)
-        iconPath = resourcePath("hourglass.ico")
-        if os.path.exists(iconPath):
-            try:
-                dialog.iconbitmap(iconPath)
-            except Exception:
-                pass
-
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.lift()
-        dialog.focus_force()
-
-        dialog.attributes("-topmost", True)
-        dialog.after(100, lambda: dialog.attributes("-topmost", False))
-
-        msg = tk.Label(
-            dialog,
-            text="A summary already exists for this date.\n\nChoose what to do:",
-            font=("Segoe UI", 10),
-            fg=self.textColor,
-            bg=self.bgColor,
-            justify="left"
-        )
-        msg.pack(padx=16, pady=(12, 8), anchor="w")
-
-        choice = {"value": None}
-
-        btnFrame = tk.Frame(dialog, bg=self.bgColor)
-        btnFrame.pack(padx=16, pady=(0, 12), anchor="e")
-
-        def setChoice(v):
-            choice["value"] = v
-            dialog.destroy()
-
-        appendBtn = tk.Button(
-            btnFrame,
-            text="Append",
-            font=("Segoe UI", 9, "bold"),
-            bg="#1b1f24",
-            fg=self.textColor,
-            activebackground="#2c3440",
-            activeforeground=self.textColor,
-            relief="flat",
-            command=lambda: setChoice("append")
-        )
-        appendBtn.grid(row=0, column=0, padx=4)
-
-        overwriteBtn = tk.Button(
-            btnFrame,
-            text="Overwrite",
-            font=("Segoe UI", 9, "bold"),
-            bg="#1b1f24",
-            fg=self.textColor,
-            activebackground="#2c3440",
-            activeforeground=self.textColor,
-            relief="flat",
-            command=lambda: setChoice("overwrite")
-        )
-        overwriteBtn.grid(row=0, column=1, padx=4)
-
-        if allowSkip:
-            skipBtn = tk.Button(
-                btnFrame,
-                text="Close without saving",
-                font=("Segoe UI", 9, "bold"),
-                bg="#1b1f24",
-                fg=self.textColor,
-                activebackground="#2c3440",
-                activeforeground=self.textColor,
-                relief="flat",
-                command=lambda: setChoice("skip")
-            )
-            skipBtn.grid(row=0, column=2, padx=4)
-
-            cancelBtn = tk.Button(
-                btnFrame,
-                text="Cancel",
-                font=("Segoe UI", 9),
-                bg="#1b1f24",
-                fg=self.textColor,
-                activebackground="#2c3440",
-                activeforeground=self.textColor,
-                relief="flat",
-                command=lambda: setChoice("cancel")
-            )
-            cancelBtn.grid(row=0, column=3, padx=4)
-        else:
-            cancelBtn = tk.Button(
-                btnFrame,
-                text="Cancel",
-                font=("Segoe UI", 9),
-                bg="#1b1f24",
-                fg=self.textColor,
-                activebackground="#2c3440",
-                activeforeground=self.textColor,
-                relief="flat",
-                command=lambda: setChoice("cancel")
-            )
-            cancelBtn.grid(row=0, column=2, padx=4)
-
-        dialog.bind("<Escape>", lambda e: setChoice("cancel"))
-
-        self.root.update_idletasks()
-        rx = self.root.winfo_rootx()
-        ry = self.root.winfo_rooty()
-        rw = self.root.winfo_width()
-        rh = self.root.winfo_height()
-        dw = 420
-        dh = 140
-        x = rx + (rw - dw) // 2
-        y = ry + (rh - dh) // 2
-        dialog.geometry(f"{dw}x{dh}+{x}+{y}")
-
-        dialog.wait_window()
-
-        if choice["value"] in (None, "cancel"):
-            return None, "cancel"
-        if choice["value"] == "skip":
-            return "__SKIP__", "skip"
-        if choice["value"] == "overwrite":
-            return newSummary, "overwrite"
-
-        newAgg, _ = self._parseSummaryText(newSummary)
-        oldAgg, _ = self._parseSummaryText(existingText)
-
-        combined = dict(oldAgg)
-        for name, hours in newAgg.items():
-            combined[name] = combined.get(name, 0.0) + hours
-
-        totalHours = 0.0
-        lines = []
-        for name, hours in sorted(combined.items(), key=lambda kv: kv[0].lower()):
-            rounded = round(hours, 1)
-            totalHours += rounded
-            lines.append(f"{name}: {rounded:.1f} h")
-        lines.append(f"Total: {totalHours:.1f} h")
-        return "\n".join(lines), "append"
-
     def endDay(self):
         now = time.time()
 
@@ -2372,22 +2269,9 @@ class TaskTrackerApp:
             messagebox.showinfo("Summary", "No tasks for today.")
             return
 
-        taskSecondsForSummary = dict(self.tasks)
-        if self.unassignedSeconds > 0:
-            taskSecondsForSummary["Untasked"] = (
-                taskSecondsForSummary.get("Untasked", 0.0) + self.unassignedSeconds
-            )
-
-        roundedHours, totalHours = self._normalizeRoundedHours(taskSecondsForSummary)
-        lines = []
-        for name, hours in sorted(roundedHours.items(), key=lambda kv: kv[0].lower()):
-            lines.append(f"{name}: {hours:.1f} h")
-        lines.append(f"Total: {totalHours:.1f} h")
-        summary = "\n".join(lines)
-
         todayKey = date.today().isoformat()
-        merged, choice = self._mergeSummaryForDate(todayKey, summary)
-        if merged is None:
+        choice = self._chooseMergeActionForDate(todayKey)
+        if choice == "cancel":
             return
 
         existingEntry = self.history.get(todayKey)
@@ -2401,32 +2285,16 @@ class TaskTrackerApp:
             timeline = list(self.dayTimeline)
 
         timeline = self._roundTimelineEdgesToHour(timeline)
+        taskSecondsSnapshot = self._collectTaskSecondsFromTimeline(timeline)
+        merged = self._buildSummaryFromTaskSeconds(taskSecondsSnapshot)
 
         self.history[todayKey] = {
             "summary": merged,
             "timeline": timeline
         }
         self.append_history_entry(todayKey, self.history[todayKey])
-        
-        taskSecondsSnapshot = dict(self.tasks)
-        if choice == "append" and existingEntry:
-            if isinstance(existingEntry, dict):
-                existingText = existingEntry.get("summary", "") or ""
-            else:
-                existingText = existingEntry or ""
-            oldAgg, _ = self._parseSummaryText(existingText)
-            for name, hours in oldAgg.items():
-                taskSecondsSnapshot[name] = taskSecondsSnapshot.get(name, 0.0) + (hours * 3600.0)
 
-        if self.unassignedSeconds > 0:
-            taskSecondsSnapshot["Untasked"] = (
-                taskSecondsSnapshot.get("Untasked", 0.0) + self.unassignedSeconds
-            )
-
-        punchThread = self.punchOut()
-        if punchThread:
-            punchThread.join()
-        self.postChargeCodeHours(taskSecondsSnapshot)
+        self._postAfterPunchOut(taskSecondsSnapshot)
         
         # CLEAR session data after saving TODO: should this be a setting?
         self.dayTimeline = []
