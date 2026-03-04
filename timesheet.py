@@ -117,8 +117,10 @@ class TaskTrackerApp:
         self._nextStatusRefreshTs = 0.0
         self._cachedChargeCodesByKey = {}
         self._cachedChargeCodesTs = 0.0
-        self._pendingChargePost = None
+        self._pendingChargePosts = []
         self._pendingChargePostLock = threading.Lock()
+        self._punchInSuccess = False
+        self._punchOutSuccess = False
 
         self.validateEnvFile()
 
@@ -126,6 +128,7 @@ class TaskTrackerApp:
         self.realPath = os.path.join(baseDir, "tasks.jsonl")
         self.dataFile = self.realPath
         self.dayTimeline = []
+        self.activeDayKey = date.today().isoformat()
 
         self.buildUi()
         self.loadData()
@@ -1331,6 +1334,165 @@ class TaskTrackerApp:
 
         return timeline
 
+    def _currentDateKey(self, nowTs=None):
+        if nowTs is None:
+            return date.today().isoformat()
+        try:
+            return datetime.fromtimestamp(nowTs).date().isoformat()
+        except Exception:
+            return date.today().isoformat()
+
+    def _saveTimelineForDate(self, dateKey, sourceTimeline, mergeChoice="append"):
+        incomingTimeline = list(sourceTimeline or [])
+        existingEntry = self.history.get(dateKey)
+        existingTimeline = []
+        if isinstance(existingEntry, dict):
+            existingTimeline = existingEntry.get("timeline", []) or []
+
+        if mergeChoice == "append":
+            timeline = list(existingTimeline) + incomingTimeline
+        else:
+            timeline = incomingTimeline
+
+        timeline = self._roundTimelineEdgesToHour(timeline)
+        taskSecondsSnapshot = self._collectTaskSecondsFromTimeline(timeline)
+        summary = self._buildSummaryFromTaskSeconds(taskSecondsSnapshot)
+
+        entry = {
+            "summary": summary,
+            "timeline": timeline
+        }
+        self.history[dateKey] = entry
+        self.append_history_entry(dateKey, entry)
+        return taskSecondsSnapshot
+
+    def _resetDaySessionState(self):
+        self.dayTimeline = []
+        self.tasks = {name: 0.0 for name in self.tasks.keys()}
+        self.unassignedSeconds = 0.0
+
+    def _showRolloverToast(self, splitDates):
+        dates = [d for d in (splitDates or []) if d]
+        if not dates:
+            return
+        try:
+            if len(dates) == 1:
+                nextDay = (date.fromisoformat(dates[0]) + timedelta(days=1)).isoformat()
+                self.showToast(
+                    f"Session crossed midnight: saved {dates[0]}, continued on {nextDay} (auto punch split applied).",
+                    timeout=3000
+                )
+            else:
+                self.showToast(
+                    f"Session crossed midnight: auto-split across {len(dates)} day transitions with punch rollover.",
+                    timeout=3000
+                )
+        except Exception:
+            pass
+
+    def _processRolloverPunchesAndPosts(self, rolloverItems):
+        items = [x for x in (rolloverItems or []) if isinstance(x, dict)]
+        if not items:
+            return
+
+        if not self.useTimesheetFunctions:
+            for item in items:
+                dayKey = item.get("dayKey")
+                snapshot = item.get("taskSecondsSnapshot")
+                self._queueChargeCodePost(snapshot, dateKey=dayKey)
+            return
+
+        self._setBusy(True)
+        try:
+            for item in items:
+                outDt = item.get("outDt")
+                inDt = item.get("inDt")
+                dayKey = item.get("dayKey")
+                snapshot = item.get("taskSecondsSnapshot")
+
+                outThread = self.punchOut(punchDt=outDt, silent=True, setBusy=False)
+                if outThread:
+                    try:
+                        outThread.join()
+                    except Exception:
+                        pass
+                if not bool(getattr(self, "_punchOutSuccess", False)):
+                    self.showToast(f"Auto punch rollover failed (OUT {dayKey}).", timeout=5000, error=True)
+                    continue
+
+                inThread = self.punchIn(punchDt=inDt, silent=True, setBusy=False)
+                if inThread:
+                    try:
+                        inThread.join()
+                    except Exception:
+                        pass
+                if not bool(getattr(self, "_punchInSuccess", False)):
+                    self.showToast(f"Auto punch rollover failed (IN {dayKey}).", timeout=5000, error=True)
+
+                self._queueChargeCodePost(snapshot, dateKey=dayKey)
+        finally:
+            self._setBusy(False)
+
+    def _rolloverIfNeeded(self, now=None):
+        if now is None:
+            now = time.time()
+
+        currentDayKey = self._currentDateKey(now)
+        activeDayKey = getattr(self, "activeDayKey", None)
+        if not activeDayKey:
+            self.activeDayKey = currentDayKey
+            return
+
+        try:
+            activeDay = date.fromisoformat(activeDayKey)
+            currentDay = date.fromisoformat(currentDayKey)
+        except Exception:
+            self.activeDayKey = currentDayKey
+            return
+
+        splitDates = []
+        rolloverItems = []
+        while activeDay < currentDay:
+            nextDay = activeDay + timedelta(days=1)
+            endOfActiveDayDt = datetime(activeDay.year, activeDay.month, activeDay.day, 23, 59, 59)
+            midnightDt = datetime(nextDay.year, nextDay.month, nextDay.day, 0, 0, 0)
+            endOfActiveDayTs = endOfActiveDayDt.timestamp()
+            midnightTs = midnightDt.timestamp()
+
+            if self.hasUnsavedTime:
+                self._closeActiveSegment(endOfActiveDayTs)
+
+                if self.currentTask is not None and self.currentStart is not None:
+                    elapsed = max(0.0, endOfActiveDayTs - self.currentStart)
+                    if elapsed > 0:
+                        self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
+                    self.currentStart = midnightTs
+                elif self.unassignedStart is not None:
+                    elapsed = max(0.0, endOfActiveDayTs - self.unassignedStart)
+                    self.unassignedSeconds += elapsed
+                    self.unassignedStart = midnightTs
+
+                dayKey = activeDay.isoformat()
+                taskSecondsSnapshot = self._saveTimelineForDate(dayKey, self.dayTimeline, mergeChoice="append")
+                splitDates.append(dayKey)
+                rolloverItems.append({
+                    "dayKey": dayKey,
+                    "taskSecondsSnapshot": taskSecondsSnapshot,
+                    "outDt": endOfActiveDayDt,
+                    "inDt": midnightDt,
+                })
+                self._resetDaySessionState()
+                self.hasUnsavedTime = bool(
+                    (self.currentTask is not None and self.currentStart is not None)
+                    or self.unassignedStart is not None
+                )
+
+            activeDay = nextDay
+
+        self.activeDayKey = currentDay.isoformat()
+        self._showRolloverToast(splitDates)
+        self._processRolloverPunchesAndPosts(rolloverItems)
+
     def _closeActiveSegment(self, now=None):
         if now is None:
             now = time.time()
@@ -1339,7 +1501,7 @@ class TaskTrackerApp:
         elif self.unassignedStart is not None:
             self._recordSegment("Untasked", self.unassignedStart, now)
 
-    def initializePunchSession(self):
+    def initializePunchSession(self, punchDateKey=None):
         try:
             posting = self._getPosting(showToast=True)
             if posting is None:
@@ -1353,8 +1515,9 @@ class TaskTrackerApp:
             self.employeeId = posting.extractEmployeeId(loginJson)
             
             posting.saveCookies(self.punchSession)
-            
-            timesheetData = posting.copyPreviousTimesheet(self.punchSession, date.today().isoformat())
+
+            targetDateKey = str(punchDateKey or date.today().isoformat())
+            timesheetData = posting.copyPreviousTimesheet(self.punchSession, targetDateKey)
             self.timesheetId = timesheetData["timesheetId"]
         except Exception as e:
             self.showToast(f"Login error: {str(e)}", timeout=5000, error=True)
@@ -1362,34 +1525,37 @@ class TaskTrackerApp:
             self.employeeId = None
             self.timesheetId = None
 
-    def punchIn(self):
+    def punchIn(self, punchDt=None, silent=False, setBusy=False):
         if not self.useTimesheetFunctions:
             return
 
         def _punchInThread():
             try:
-                self.root.after(0, lambda: self.showToast("Clocking in…", timeout=1500))
+                if setBusy:
+                    self.root.after(0, lambda: self._setBusy(True))
+                if not silent:
+                    self.root.after(0, lambda: self.showToast("Clocking in…", timeout=1500))
                 posting = self._getPosting(showToast=True)
                 if posting is None:
                     return
 
-                self.initializePunchSession()
+                ts = punchDt if isinstance(punchDt, datetime) else datetime.now()
+                self.initializePunchSession(ts.date().isoformat())
 
                 if self.punchSession is None or self.employeeId is None:
                     return
 
-                punchDt = datetime.now()
-                if self.roundToHours:
+                if punchDt is None and self.roundToHours:
                     try:
                         h, m = (self.workDayStart).split(":")
-                        workStartDt = punchDt.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-                        if abs((punchDt - workStartDt).total_seconds()) <= 5 * 60:
-                            punchDt = workStartDt
+                        workStartDt = ts.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+                        if abs((ts - workStartDt).total_seconds()) <= 5 * 60:
+                            ts = workStartDt
                     except Exception:
                         pass
                 punchPayload = {
                     "id": "",
-                    "punchDate": punchDt.strftime("%m/%d/%Y %I:%M %p"),
+                    "punchDate": ts.strftime("%m/%d/%Y %I:%M %p"),
                     "type": "IN",
                     "employeeId": self.employeeId,
                     "timesheetPage": True,
@@ -1397,40 +1563,51 @@ class TaskTrackerApp:
                     "new": True
                 }
                 posting.postPunch(self.punchSession, punchPayload)
-                self.showToast("Successfully clocked in!")
+                self._punchInSuccess = True
+                if not silent:
+                    self.showToast("Successfully clocked in!")
             except Exception as e:
-                self.showToast(f"✗ Clock in failed: {e}", error=True)
+                self._punchInSuccess = False
+                if not silent:
+                    self.showToast(f"✗ Clock in failed: {e}", error=True)
+            finally:
+                if setBusy:
+                    self.root.after(0, lambda: self._setBusy(False))
 
-        threading.Thread(target=_punchInThread, daemon=True).start()
+        thread = threading.Thread(target=_punchInThread, daemon=True)
+        thread.start()
+        return thread
 
-    def punchOut(self):
+    def punchOut(self, punchDt=None, silent=False, setBusy=True):
         if not self.useTimesheetFunctions:
             return
         
         def _punchOutThread():
             try:
-                self.root.after(0, lambda: self._setBusy(True))
-                self.root.after(0, lambda: self.showToast("Clocking out…", timeout=1500))
+                if setBusy:
+                    self.root.after(0, lambda: self._setBusy(True))
+                if not silent:
+                    self.root.after(0, lambda: self.showToast("Clocking out…", timeout=1500))
                 posting = self._getPosting(showToast=True)
                 if posting is None:
                     return
 
-                self.initializePunchSession()
+                ts = punchDt if isinstance(punchDt, datetime) else datetime.now()
+                self.initializePunchSession(ts.date().isoformat())
 
                 if self.punchSession is None or self.employeeId is None:
                     return
-                punchDt = datetime.now()
-                if self.roundToHours:
+                if punchDt is None and self.roundToHours:
                     try:
                         h, m = (self.workDayEnd).split(":")
-                        workEndDt = punchDt.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-                        if abs((punchDt - workEndDt).total_seconds()) <= 5 * 60:
-                            punchDt = workEndDt
+                        workEndDt = ts.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+                        if abs((ts - workEndDt).total_seconds()) <= 5 * 60:
+                            ts = workEndDt
                     except Exception:
                         pass
                 punchPayload = {
                     "id": "",
-                    "punchDate": punchDt.strftime("%m/%d/%Y %I:%M %p"),
+                    "punchDate": ts.strftime("%m/%d/%Y %I:%M %p"),
                     "type": "OUT",
                     "employeeId": self.employeeId,
                     "revisionNumber": -1,
@@ -1449,16 +1626,17 @@ class TaskTrackerApp:
             except Exception as e:
                 self._punchOutSuccess = False
             finally:
-                self.root.after(0, lambda: self._setBusy(False))
+                if setBusy:
+                    self.root.after(0, lambda: self._setBusy(False))
         
         thread = threading.Thread(target=_punchOutThread, daemon=True)
         thread.start()
         return thread
 
-    def _postAfterPunchOut(self, taskSecondsSnapshot):
+    def _postAfterPunchOut(self, taskSecondsSnapshot, dateKey=None):
         punchThread = self.punchOut()
         if not punchThread:
-            self._queueChargeCodePost(taskSecondsSnapshot)
+            self._queueChargeCodePost(taskSecondsSnapshot, dateKey=dateKey)
             return
 
         def _waitAndPost():
@@ -1467,17 +1645,21 @@ class TaskTrackerApp:
             except Exception:
                 pass
 
-            self._queueChargeCodePost(taskSecondsSnapshot)
+            self._queueChargeCodePost(taskSecondsSnapshot, dateKey=dateKey)
 
         threading.Thread(target=_waitAndPost, daemon=True).start()
 
-    def _queueChargeCodePost(self, taskSecondsSnapshot):
+    def _queueChargeCodePost(self, taskSecondsSnapshot, dateKey=None):
         snapshot = dict(taskSecondsSnapshot or {})
+        item = {
+            "taskSecondsSnapshot": snapshot,
+            "dateKey": dateKey if dateKey else None,
+        }
         try:
             with self._pendingChargePostLock:
-                self._pendingChargePost = snapshot
+                self._pendingChargePosts.append(item)
         except Exception:
-            self._pendingChargePost = snapshot
+            self._pendingChargePosts.append(item)
 
     def postChargeCodeHours(self, taskSecondsSnapshot=None, dateKey=None):
         if not self.autoChargeCodes:
@@ -1684,8 +1866,8 @@ class TaskTrackerApp:
         self.stopUnassigned(now)
 
         if self.hasUnsavedTime:
-            todayKey = date.today().isoformat()
-            choice = self._chooseMergeActionForDate(todayKey, allowSkip=True)
+            dayKey = self._currentDateKey(now)
+            choice = self._chooseMergeActionForDate(dayKey, allowSkip=True)
             if choice == "cancel":
                 return
 
@@ -1695,26 +1877,8 @@ class TaskTrackerApp:
                 self.root.destroy()
                 return
 
-            existingEntry = self.history.get(todayKey)
-            existingTimeline = []
-            if isinstance(existingEntry, dict):
-                existingTimeline = existingEntry.get("timeline", []) or []
-
-            if choice == "append":
-                timeline = existingTimeline + list(self.dayTimeline)
-            else:
-                timeline = list(self.dayTimeline)
-
-            timeline = self._roundTimelineEdgesToHour(timeline)
-            taskSecondsSnapshot = self._collectTaskSecondsFromTimeline(timeline)
-            merged = self._buildSummaryFromTaskSeconds(taskSecondsSnapshot)
-
-            self.history[todayKey] = {
-                "summary": merged,
-                "timeline": timeline
-            }
-            # append only the day's summary to the jsonl log
-            self.append_history_entry(todayKey, self.history[todayKey])
+            mergeChoice = "append" if choice == "append" else "overwrite"
+            taskSecondsSnapshot = self._saveTimelineForDate(dayKey, self.dayTimeline, mergeChoice=mergeChoice)
             
             # Punch out when closing with unsaved time
             punchThread = self.punchOut()
@@ -1724,7 +1888,7 @@ class TaskTrackerApp:
                 self.showToast("Successfully clocked out!")
             else:
                 self.showToast(f"✗ Clock out failed!", error=True)
-            self.postChargeCodeHours(taskSecondsSnapshot)
+            self.postChargeCodeHours(taskSecondsSnapshot, dateKey=dayKey)
             
             self.hasUnsavedTime = False
             self.dayTimeline = []
@@ -1769,9 +1933,9 @@ class TaskTrackerApp:
         
         self.dayTimeline = []
         
-        todayKey = date.today().isoformat()
-        if todayKey in self.history:
-            del self.history[todayKey]
+        dayKey = self._currentDateKey(now)
+        if dayKey in self.history:
+            del self.history[dayKey]
         
         self.hasUnsavedTime = False
         self.refreshRowStyles()
@@ -1885,23 +2049,31 @@ class TaskTrackerApp:
             self.deleteTaskPrompt(self.currentTask)
 
     def updateLoop(self):
-        pendingPost = None
+        now = time.time()
+
+        pendingPosts = []
         try:
             with self._pendingChargePostLock:
-                if self._pendingChargePost is not None:
-                    pendingPost = self._pendingChargePost
-                    self._pendingChargePost = None
+                if self._pendingChargePosts:
+                    pendingPosts = list(self._pendingChargePosts)
+                    self._pendingChargePosts = []
         except Exception:
-            pendingPost = self._pendingChargePost
-            self._pendingChargePost = None
+            pendingPosts = list(getattr(self, "_pendingChargePosts", []) or [])
+            self._pendingChargePosts = []
 
-        if pendingPost is not None:
-            self.postChargeCodeHours(pendingPost)
+        for item in pendingPosts:
+            if not isinstance(item, dict):
+                self.postChargeCodeHours(item)
+                continue
+            self.postChargeCodeHours(
+                item.get("taskSecondsSnapshot"),
+                dateKey=item.get("dateKey")
+            )
 
         for name, baseSeconds in self.tasks.items():
             extra = 0.0
             if name == self.currentTask and self.currentStart is not None:
-                extra = time.time() - self.currentStart
+                extra = now - self.currentStart
             total = baseSeconds + extra
             if total < 60:
                 text = f"{total:05.2f}s"
@@ -2253,6 +2425,7 @@ class TaskTrackerApp:
 
     def endDay(self):
         now = time.time()
+        self._rolloverIfNeeded(now)
 
         self._closeActiveSegment(now)
 
@@ -2269,37 +2442,19 @@ class TaskTrackerApp:
             messagebox.showinfo("Summary", "No tasks for today.")
             return
 
-        todayKey = date.today().isoformat()
-        choice = self._chooseMergeActionForDate(todayKey)
+        dayKey = getattr(self, "activeDayKey", self._currentDateKey(now))
+        choice = self._chooseMergeActionForDate(dayKey)
         if choice == "cancel":
             return
 
-        existingEntry = self.history.get(todayKey)
-        existingTimeline = []
-        if isinstance(existingEntry, dict):
-            existingTimeline = existingEntry.get("timeline", []) or []
+        mergeChoice = "append" if choice == "append" else "overwrite"
+        taskSecondsSnapshot = self._saveTimelineForDate(dayKey, self.dayTimeline, mergeChoice=mergeChoice)
+        merged = self.history.get(dayKey, {}).get("summary", "")
 
-        if choice == "append":
-            timeline = existingTimeline + list(self.dayTimeline)
-        else:
-            timeline = list(self.dayTimeline)
-
-        timeline = self._roundTimelineEdgesToHour(timeline)
-        taskSecondsSnapshot = self._collectTaskSecondsFromTimeline(timeline)
-        merged = self._buildSummaryFromTaskSeconds(taskSecondsSnapshot)
-
-        self.history[todayKey] = {
-            "summary": merged,
-            "timeline": timeline
-        }
-        self.append_history_entry(todayKey, self.history[todayKey])
-
-        self._postAfterPunchOut(taskSecondsSnapshot)
+        self._postAfterPunchOut(taskSecondsSnapshot, dateKey=dayKey)
         
         # CLEAR session data after saving TODO: should this be a setting?
-        self.dayTimeline = []
-        self.tasks = {name: 0.0 for name in self.tasks.keys()}
-        self.unassignedSeconds = 0.0
+        self._resetDaySessionState()
         self.unassignedStart = None
         self.currentTask = None
         self.currentStart = None
