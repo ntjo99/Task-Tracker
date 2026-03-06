@@ -101,7 +101,6 @@ def openSettings(app):
 
     settings = loadSettings(settingsPath)
     chargeCodes = loadChargeCodesFromJsonl(dataFile)
-    groupChargeCodeMap = dict(settings.get("groupChargeCodeMap", {}))
 
     def sanitizeHexColor(value):
         if not isinstance(value, str):
@@ -1121,6 +1120,7 @@ def openSettings(app):
 
     chargeCodeVars = {}
     chargeCodeChunks = []
+    removedChargeCodeIdxs = set()
 
     def readGroupKeyForChunk(chunkIdx):
         try:
@@ -1142,6 +1142,11 @@ def openSettings(app):
     def rebuildChargeCodeTable():
         nonlocal chargeCodeChunks, chargeCodeVars
 
+        previousSelections = {
+            idx: (var.get() or "").strip()
+            for idx, var in chargeCodeVars.items()
+        }
+
         for child in tableFrame.winfo_children():
             child.destroy()
 
@@ -1162,11 +1167,16 @@ def openSettings(app):
             scrollCanvas.config(scrollregion=scrollCanvas.bbox("all"))
             return
 
+        visibleRows = 0
         for chunkIdx, chunkCodes in enumerate(chargeCodeChunks):
+            if chunkIdx in removedChargeCodeIdxs:
+                continue
+
             rowFrame = tk.Frame(tableFrame, bg=app.cardColor)
-            rowFrame.grid(row=chunkIdx, column=0, columnspan=2, sticky="ew", padx=0, pady=6)
+            rowFrame.grid(row=visibleRows, column=0, columnspan=2, sticky="ew", padx=0, pady=6)
             rowFrame.columnconfigure(0, weight=1)
             rowFrame.columnconfigure(1, weight=0)
+            rowFrame.columnconfigure(2, weight=0)
 
             codeNamesText = " | ".join([str(c.get("chargeCodeName") or "") for c in chunkCodes])            
             codesLabel = tk.Label(
@@ -1180,7 +1190,9 @@ def openSettings(app):
             )
             codesLabel.grid(row=0, column=0, sticky="w", padx=12, pady=6)
 
-            currentGroup = readGroupKeyForChunk(chunkIdx)
+            currentGroup = previousSelections.get(chunkIdx)
+            if currentGroup is None:
+                currentGroup = readGroupKeyForChunk(chunkIdx)
 
             chunkVar = tk.StringVar(value=currentGroup)
             chargeDrop = tk.OptionMenu(rowFrame, chunkVar, *taskGroupOptions)
@@ -1197,9 +1209,42 @@ def openSettings(app):
             )
 
             chargeCodeVars[chunkIdx] = chunkVar
+            visibleRows += 1
+
+            removeBtn = tk.Button(
+                rowFrame,
+                text="-",
+                font=("Segoe UI", 10, "bold"),
+                bg=app.cardColor,
+                fg="#d94a4a",
+                activebackground=app.cardColor,
+                activeforeground="#ff6a6a",
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                takefocus=0,
+                width=2,
+                command=lambda idx=chunkIdx: markChargeCodeForRemoval(idx)
+            )
+            removeBtn.grid(row=0, column=2, sticky="e", padx=(20, 2), pady=6)
+            removeBtn.config(cursor="hand2")
+
+        if visibleRows == 0:
+            noCodesLabel = tk.Label(
+                tableFrame,
+                text="All charge codes are marked for removal. Click Save to apply.",
+                font=("Segoe UI", 9),
+                fg="#999999",
+                bg=app.cardColor
+            )
+            noCodesLabel.pack(padx=12, pady=12)
 
         tableFrame.update_idletasks()
         scrollCanvas.config(scrollregion=scrollCanvas.bbox("all"))
+
+    def markChargeCodeForRemoval(chunkIdx):
+        removedChargeCodeIdxs.add(chunkIdx)
+        rebuildChargeCodeTable()
 
     def pullAndRefreshChargeCodes():
         if str(refreshBtn.cget("state")) == "disabled":
@@ -1227,7 +1272,11 @@ def openSettings(app):
 
                 posting.insertChargeCodesBetweenGroupAndHistory(dataFile, models)
 
-                win.after(0, rebuildChargeCodeTable)
+                def _refresh_table():
+                    removedChargeCodeIdxs.clear()
+                    rebuildChargeCodeTable()
+
+                win.after(0, _refresh_table)
 
                 if hasattr(app, "showToast"):
                     app.showToast("Charge codes refreshed")
@@ -1359,7 +1408,7 @@ def openSettings(app):
             json.dump(settings, f, indent=2)
 
         # Write charge code mappings to JSONL
-        updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars)
+        updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars, removedChargeCodeIdxs)
         if renamedAny:
             if hasattr(app, "rewrite_data_file"):
                 if not app.rewrite_data_file():
@@ -1439,14 +1488,16 @@ def openSettings(app):
     applyBaseUrlState()
 
 
-def updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars):
+def updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars, removedChargeCodeIdxs=None):
     if not os.path.exists(dataFile):
         return
 
     tmpPath = dataFile + ".tmp"
+    removedIdxs = set(removedChargeCodeIdxs or [])
 
     try:
         ccIdx = 0
+        keptChunkIdx = 0
 
         with open(dataFile, "r", encoding="utf-8") as src, open(tmpPath, "w", encoding="utf-8") as dst:
             for raw in src:
@@ -1465,14 +1516,20 @@ def updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars):
                     dst.write(raw)
                     continue
 
+                if ccIdx in removedIdxs:
+                    ccIdx += 1
+                    continue
+
                 groupKey = chargeCodeVars.get(ccIdx, tk.StringVar()).get().strip()
                 if not groupKey or groupKey == "<None>":
                     groupKey = ""
 
                 obj["groupKey"] = groupKey
+                obj["chunkIndex"] = keptChunkIdx
 
                 dst.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
                 ccIdx += 1
+                keptChunkIdx += 1
 
         os.replace(tmpPath, dataFile)
 
