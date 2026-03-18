@@ -1,10 +1,6 @@
 # Task Tracker
 ##### A simple program that allows you to track your time spent on tasks.    
 
-### Agent Informatics
-- For implementation maps, logic flow references, and "where to edit what", see `AGENT_INFORMATICS.md`.
-- This is intended for future coding agents and maintainers, not end users.
-
 ### History
 - In the top right of the app there is a button labelled `History`. This will show you summaries of your previous times.  
 - It will show summaries for daily times recorded, as well as cumulative times spent for pay periods.  
@@ -38,4 +34,5 @@
 
 ## Installer Command
 `pyinstaller --onefile --windowed --icon=hourglass.ico --add-data "hourglass.ico;." timesheet.py`
+
 
