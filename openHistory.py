@@ -1,6 +1,6 @@
 from datetime import date, timedelta, datetime
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, font as tkfont
 import sys
 import os
 import openEdit
@@ -143,6 +143,27 @@ def openHistory(self):
             p["agg"] = agg
             p["total"] = total
 
+        # Synthetic overview used only when the user explicitly asks for an
+        # all-history stacked area chart.
+        totalOverview = {"days": [], "agg": {}, "total": 0.0}
+
+        def recomputeTotalOverview():
+            agg = {}
+            total = 0.0
+            days = sorted({dStr for p in periods for dStr in p.get("days", [])})
+
+            for dStr in days:
+                dayAgg, dayTotal = parseDaySummary(dStr)
+                for k, v in dayAgg.items():
+                    agg[k] = agg.get(k, 0.0) + v
+                total += dayTotal
+
+            totalOverview["days"] = days
+            totalOverview["agg"] = agg
+            totalOverview["total"] = total
+
+        recomputeTotalOverview()
+
         # helper to recompute period aggregates after edits
         def updatePeriods():
             nonlocal periods
@@ -156,9 +177,14 @@ def openHistory(self):
                     total += dayTotal
                 p["agg"] = agg
                 p["total"] = total
+            recomputeTotalOverview()
             # ensure UI shows recalculated data
             try:
                 showPayPeriodSummary()
+            except Exception:
+                pass
+            try:
+                refreshTotalAreaWindow()
             except Exception:
                 pass
 
@@ -354,8 +380,11 @@ def openHistory(self):
         )
         ppSummaryLabel.grid(row=2, column=0, sticky="w")
 
+        ppControlFrame = tk.Frame(textFrame, bg=self.bgColor)
+        ppControlFrame.grid(row=2, column=1, sticky="e")
+
         ppChartModeBtn = tk.Button(
-            textFrame,
+            ppControlFrame,
             text="Area",
             font=("Segoe UI", 9, "bold"),
             bg="#1b1f24",
@@ -364,7 +393,19 @@ def openHistory(self):
             activeforeground=self.textColor,
             relief="flat"
         )
-        ppChartModeBtn.grid(row=2, column=1, sticky="e")
+        ppChartModeBtn.pack(side="right")
+
+        totalAreaBtn = tk.Button(
+            ppControlFrame,
+            text="Total Area",
+            font=("Segoe UI", 9),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat"
+        )
+        totalAreaBtn.pack(side="right", padx=(0, 8))
 
         ppSummaryBox = tk.Text(
             textFrame,
@@ -482,12 +523,22 @@ def openHistory(self):
             btn.bind("<Enter>", lambda e: btn.config(bg=hover), add="+")
             btn.bind("<Leave>", lambda e: btn.config(bg=normal_bg), add="+")
 
-        for b in (timelineModeBtn, editDayBtn, ppChartModeBtn, setGroupBtn, clearGroupBtn):
+        for b in (timelineModeBtn, editDayBtn, ppChartModeBtn, totalAreaBtn, setGroupBtn, clearGroupBtn):
             style_btn(b)
 
         current = {"ppIndex": 0, "timelineMode": "gantt", "ppChartMode": "pie", "dayKey": None}
         allTasks = collectAllTasks()
         taskNames = list(allTasks)
+        totalAreaState = {
+            "win": None,
+            "canvas": None,
+            "legendCanvas": None,
+            "summaryBox": None,
+            "subtitleLabel": None,
+            "labels": {},
+            "tooltip": {"win": None, "item": None},
+            "redrawJob": None
+        }
 
         def formatLines(total, taskAgg):
             lines = [f"Total: {total:.1f} h"]
@@ -646,59 +697,140 @@ def openHistory(self):
                 pieSlices[item] = labelText
                 startAngle += extent
 
-        def drawPayPeriodStackedArea(period, taskAgg):
-            nonlocal pieSlices, ppColorMap
+        def buildStackedAreaSeries(period, bucketSize=1, averageBuckets=False):
+            days = sorted(period.get("days", []))
+            if not days:
+                return [], [], 0.0
 
-            ppPieCanvas.delete("all")
-            pieSlices = {}
+            try:
+                bucketSize = max(1, int(bucketSize))
+            except Exception:
+                bucketSize = 1
+
+            seriesAgg = []
+            seriesLabels = []
+            maxSeriesTotal = 0.0
+
+            for startIdx in range(0, len(days), bucketSize):
+                bucketDays = days[startIdx:startIdx + bucketSize]
+                bucketAgg = {}
+                bucketTotal = 0.0
+
+                for dStr in bucketDays:
+                    dayAgg, dayTotal = parseDaySummary(dStr)
+                    for k, v in dayAgg.items():
+                        bucketAgg[k] = bucketAgg.get(k, 0.0) + v
+                    bucketTotal += dayTotal
+
+                divisor = float(len(bucketDays)) if averageBuckets and bucketDays else 1.0
+                if divisor > 1.0:
+                    for k in list(bucketAgg.keys()):
+                        bucketAgg[k] = bucketAgg[k] / divisor
+                    bucketTotal = bucketTotal / divisor
+
+                maxSeriesTotal = max(maxSeriesTotal, bucketTotal)
+                seriesAgg.append(bucketAgg)
+
+                label = bucketDays[0]
+                try:
+                    parsed = [date.fromisoformat(d) for d in bucketDays]
+                    if len(parsed) == 1:
+                        label = parsed[0].strftime("%m-%d")
+                    else:
+                        mid = parsed[len(parsed) // 2]
+                        label = mid.strftime("%m-%d")
+                except ValueError:
+                    pass
+                seriesLabels.append(label)
+
+            return seriesAgg, seriesLabels, maxSeriesTotal
+
+        def computeAutoBucketSize(period, canvasWidth, targetPointSpacing=26.0):
+            days = sorted(period.get("days", []))
+            dayCount = len(days)
+            if dayCount <= 1:
+                return 1
+
+            try:
+                canvasWidth = float(canvasWidth)
+            except Exception:
+                canvasWidth = 240.0
+
+            marginLeft = 28.0
+            marginRight = 14.0
+            plotW = max(1.0, canvasWidth - marginLeft - marginRight)
+            maxPoints = max(2, int(plotW // max(12.0, float(targetPointSpacing))) + 1)
+
+            if dayCount <= maxPoints:
+                return min(dayCount, 3)
+
+            return max(3, (dayCount + maxPoints - 1) // maxPoints)
+
+        def softenSeriesPoints(points, subdivisions=5):
+            if len(points) <= 1 or subdivisions <= 1:
+                return list(points)
+
+            softened = [points[0]]
+            for i in range(len(points) - 1):
+                x0, y0 = points[i]
+                x1, y1 = points[i + 1]
+                for step in range(1, subdivisions + 1):
+                    t = step / float(subdivisions)
+                    eased = t * t * (3.0 - 2.0 * t)
+                    x = x0 + (x1 - x0) * t
+                    y = y0 + (y1 - y0) * eased
+                    softened.append((x, y))
+            return softened
+
+        def drawStackedArea(canvas, period, taskAgg, itemLabels, colorMap, minDayWidth=0.0, bucketSize=1, averageBuckets=False, softenCurves=False, curveSubdivisions=5):
+            canvas.delete("all")
+            itemLabels.clear()
 
             days = sorted(period.get("days", []))
             if not days or not taskAgg:
-                return
+                canvas.update_idletasks()
+                w = canvas.winfo_width() or 240
+                h = canvas.winfo_height() or 160
+                canvas.configure(scrollregion=(0, 0, w, h))
+                return {"bucketSize": max(1, int(bucketSize)), "pointCount": 0, "dayCount": len(days)}
 
-            if not ppColorMap:
-                computePayPeriodColorMap(taskAgg)
-
-            perDayAgg = []
-            dayLabels = []
-            maxDayTotal = 0.0
-
-            for dStr in days:
-                dayAgg, dayTotal = parseDaySummary(dStr)
-                perDayAgg.append(dayAgg)
-                maxDayTotal = max(maxDayTotal, dayTotal)
-                try:
-                    d = date.fromisoformat(dStr)
-                    dayLabels.append(d.strftime("%m-%d"))
-                except ValueError:
-                    dayLabels.append(dStr)
+            perDayAgg, dayLabels, maxDayTotal = buildStackedAreaSeries(
+                period,
+                bucketSize=bucketSize,
+                averageBuckets=averageBuckets
+            )
 
             if maxDayTotal <= 0:
-                return
+                return {"bucketSize": max(1, int(bucketSize)), "pointCount": len(perDayAgg), "dayCount": len(days)}
 
             tasksOrdered = [k for k, v in sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True) if v > 0]
             if not tasksOrdered:
-                return
+                return {"bucketSize": max(1, int(bucketSize)), "pointCount": len(perDayAgg), "dayCount": len(days)}
 
-            ppPieCanvas.update_idletasks()
-            w = ppPieCanvas.winfo_width() or 240
-            h = ppPieCanvas.winfo_height() or 160
+            canvas.update_idletasks()
+            w = canvas.winfo_width() or 240
+            h = canvas.winfo_height() or 160
 
             marginLeft = 28
-            marginRight = 10
+            marginRight = 14
             marginTop = 10
             marginBottom = 22
 
             left = marginLeft
-            right = max(left + 1, w - marginRight)
             top = marginTop
             bottom = max(top + 1, h - marginBottom)
-            plotW = max(1, right - left)
+            visiblePlotW = max(1, w - marginLeft - marginRight)
+            minPlotW = 0.0
+            if minDayWidth > 0:
+                minPlotW = minDayWidth if len(perDayAgg) == 1 else (len(perDayAgg) - 1) * minDayWidth
+            plotW = max(1, visiblePlotW, int(round(minPlotW)))
+            right = left + plotW
             plotH = max(1, bottom - top)
+            canvas.configure(scrollregion=(0, 0, right + marginRight, h))
 
-            n = len(days)
+            n = len(perDayAgg)
 
-            ppPieCanvas.create_line(left, bottom, right, bottom, fill="#6b7280")
+            canvas.create_line(left, bottom, right, bottom, fill="#6b7280")
 
             if n == 1:
                 barWidth = min(max(30.0, plotW * 0.25), 70.0)
@@ -715,22 +847,22 @@ def openHistory(self):
                     y2 = y
                     y1 = max(top, y - hPx)
 
-                    item = ppPieCanvas.create_rectangle(
+                    item = canvas.create_rectangle(
                         x1, y1, x2, y2,
-                        fill=ppColorMap.get(task, self.accentColor),
+                        fill=colorMap.get(task, self.accentColor),
                         outline=""
                     )
-                    pieSlices[item] = f"{task} ({v:.1f}h)"
+                    itemLabels[item] = f"{task} ({v:.1f}h)"
                     y = y1
 
-                ppPieCanvas.create_text(
+                canvas.create_text(
                     left, bottom + 4,
                     text=dayLabels[0],
                     fill="#9ca3af",
                     anchor="nw",
                     font=("Segoe UI", 7)
                 )
-                return
+                return {"bucketSize": max(1, int(bucketSize)), "pointCount": 1, "dayCount": len(days)}
 
             xs = [left + (i / float(n - 1)) * plotW for i in range(n)]
             cumulative = [0.0 for _ in range(n)]
@@ -759,9 +891,19 @@ def openHistory(self):
                 for x, y in reversed(basePts):
                     points.extend([x, y])
 
-                color = ppColorMap.get(task, self.accentColor)
-                item = ppPieCanvas.create_polygon(points, fill=color, outline="")
-                pieSlices[item] = f"{task} ({taskAgg.get(task, 0.0):.1f}h)"
+                if softenCurves and len(topPts) >= 3:
+                    smoothSteps = max(2, int(curveSubdivisions))
+                    softenedTop = softenSeriesPoints(topPts, subdivisions=smoothSteps)
+                    softenedBase = softenSeriesPoints(basePts, subdivisions=smoothSteps)
+                    points = []
+                    for x, y in softenedTop:
+                        points.extend([x, y])
+                    for x, y in reversed(softenedBase):
+                        points.extend([x, y])
+
+                color = colorMap.get(task, self.accentColor)
+                item = canvas.create_polygon(points, fill=color, outline="")
+                itemLabels[item] = f"{task} ({taskAgg.get(task, 0.0):.1f}h)"
 
             # choose label indices to avoid crowding; always include first and last
             label_spacing_px = 70  # desired min pixels between labels
@@ -780,7 +922,7 @@ def openHistory(self):
                 x = xs[idx]
                 # clamp to canvas bounds so text isn't clipped
                 x = max(left + 2, min(x, left + plotW - 2))
-                ppPieCanvas.create_text(
+                canvas.create_text(
                     x,
                     bottom + 4,
                     text=dayLabels[idx],
@@ -788,6 +930,16 @@ def openHistory(self):
                     anchor="n",
                     font=("Segoe UI", 7)
                 )
+
+            return {"bucketSize": max(1, int(bucketSize)), "pointCount": n, "dayCount": len(days)}
+
+        def drawPayPeriodStackedArea(period, taskAgg):
+            nonlocal pieSlices, ppColorMap
+
+            pieSlices = {}
+            if not ppColorMap:
+                computePayPeriodColorMap(taskAgg)
+            drawStackedArea(ppPieCanvas, period, taskAgg, pieSlices, ppColorMap)
 
         def showPieTooltip(event):
             items = ppPieCanvas.find_withtag("current")
@@ -834,19 +986,354 @@ def openHistory(self):
                 pieTooltip["win"] = None
             pieTooltip["item"] = None
 
+        def hideTotalAreaTooltip(event=None):
+            tooltipState = totalAreaState["tooltip"]
+            if tooltipState["win"] is not None:
+                tooltipState["win"].destroy()
+                tooltipState["win"] = None
+            tooltipState["item"] = None
+
+        def showTotalAreaTooltip(event):
+            canvas = totalAreaState.get("canvas")
+            if canvas is None or not canvas.winfo_exists():
+                return
+
+            items = canvas.find_withtag("current")
+            if not items:
+                hideTotalAreaTooltip(event)
+                return
+
+            item = items[0]
+            tooltipState = totalAreaState["tooltip"]
+
+            if item == tooltipState["item"] and tooltipState["win"] is not None:
+                return
+
+            labelText = totalAreaState.get("labels", {}).get(item)
+            if not labelText:
+                hideTotalAreaTooltip(event)
+                return
+
+            if tooltipState["win"] is not None:
+                tooltipState["win"].destroy()
+
+            tw = tk.Toplevel(canvas)
+            tw.wm_overrideredirect(True)
+            tw.configure(bg="#000000")
+
+            x = event.x_root + 10
+            y = event.y_root + 10
+            tw.wm_geometry(f"+{x}+{y}")
+
+            lbl = tk.Label(
+                tw,
+                text=labelText,
+                bg="#111827",
+                fg="#f9fafb",
+                font=("Segoe UI", 8)
+            )
+            lbl.pack(ipadx=4, ipady=2)
+
+            tooltipState["win"] = tw
+            tooltipState["item"] = item
+
+        def drawTotalAreaLegend(legendCanvas, taskAgg, colorMap):
+            if legendCanvas is None or not legendCanvas.winfo_exists():
+                return
+
+            legendCanvas.delete("all")
+            legendCanvas.update_idletasks()
+
+            width = max(220, legendCanvas.winfo_width() or 220)
+            height = max(28, legendCanvas.winfo_height() or 28)
+            legendCanvas.configure(scrollregion=(0, 0, width, height))
+
+            items = [(name, hours) for name, hours in sorted(taskAgg.items(), key=lambda kv: kv[1], reverse=True) if float(hours) > 0.0]
+            if not items:
+                return
+
+            legendFont = tkfont.Font(family="Segoe UI", size=9)
+            x = 10
+            y = 10
+            rowH = 22
+            swatch = 10
+            gap = 6
+            itemGap = 16
+            maxX = width - 10
+
+            for name, _hours in items:
+                textW = legendFont.measure(name)
+                itemW = swatch + gap + textW + itemGap
+
+                if x > 10 and (x + itemW) > maxX:
+                    x = 10
+                    y += rowH
+
+                color = colorMap.get(name, self.accentColor)
+                legendCanvas.create_rectangle(
+                    x,
+                    y + 3,
+                    x + swatch,
+                    y + 3 + swatch,
+                    fill=color,
+                    outline=""
+                )
+                legendCanvas.create_text(
+                    x + swatch + gap,
+                    y + 8,
+                    text=name,
+                    anchor="w",
+                    fill=self.textColor,
+                    font=legendFont
+                )
+                x += itemW
+
+            totalH = y + rowH
+            legendCanvas.configure(height=max(28, totalH + 2), scrollregion=(0, 0, width, totalH + 2))
+
+        def refreshTotalAreaWindow(resetScroll=False):
+            win = totalAreaState.get("win")
+            canvas = totalAreaState.get("canvas")
+            legendCanvas = totalAreaState.get("legendCanvas")
+            summaryBox = totalAreaState.get("summaryBox")
+            subtitleLabel = totalAreaState.get("subtitleLabel")
+
+            if win is None or not win.winfo_exists() or canvas is None or not canvas.winfo_exists():
+                return
+
+            agg = totalOverview.get("agg", {})
+            total = totalOverview.get("total", 0.0)
+            colorMap = self.buildTaskColorMap(agg)
+            canvas.update_idletasks()
+            bucketSize = computeAutoBucketSize(totalOverview, canvas.winfo_width() or 240, targetPointSpacing=22.0)
+            roundnessSteps = 9
+
+            labels = {}
+            meta = drawStackedArea(
+                canvas,
+                totalOverview,
+                agg,
+                labels,
+                colorMap,
+                minDayWidth=0.0,
+                bucketSize=bucketSize,
+                averageBuckets=True,
+                softenCurves=(roundnessSteps > 1),
+                curveSubdivisions=roundnessSteps
+            )
+            totalAreaState["labels"] = labels
+
+            drawTotalAreaLegend(legendCanvas, agg, colorMap)
+
+            if subtitleLabel is not None and subtitleLabel.winfo_exists():
+                usedBucket = int(meta.get("bucketSize", bucketSize))
+                pointCount = int(meta.get("pointCount", 0))
+                dayCount = int(meta.get("dayCount", len(totalOverview.get("days", []))))
+                if usedBucket <= 1:
+                    subtitleText = f"Smoothed stacked area ({pointCount} points)"
+                else:
+                    subtitleText = (
+                        f"Auto-grouped in {usedBucket}-day averages, "
+                        f"({dayCount} days -> {pointCount} points)"
+                    )
+                subtitleLabel.config(text=subtitleText)
+
+            if summaryBox is not None and summaryBox.winfo_exists():
+                summaryBox.delete("1.0", tk.END)
+                summaryBox.insert(tk.END, "\n".join(formatLines(total, agg)))
+
+                for name, color in colorMap.items():
+                    tagName = f"total_{name}"
+                    try:
+                        summaryBox.tag_configure(tagName, foreground=color)
+                    except tk.TclError:
+                        continue
+
+                    start = "1.0"
+                    pattern = f"{name}:"
+                    while True:
+                        pos = summaryBox.search(pattern, start, tk.END)
+                        if not pos:
+                            break
+                        end = f"{pos}+{len(name)}c"
+                        summaryBox.tag_add(tagName, pos, end)
+                        start = f"{end}+1c"
+
+        def runTotalAreaRedraw():
+            totalAreaState["redrawJob"] = None
+            refreshTotalAreaWindow()
+
+        def scheduleTotalAreaRedraw(event=None):
+            canvas = totalAreaState.get("canvas")
+            if canvas is None or not canvas.winfo_exists():
+                return
+
+            job = totalAreaState.get("redrawJob")
+            if job is not None:
+                try:
+                    canvas.after_cancel(job)
+                except Exception:
+                    pass
+
+            totalAreaState["redrawJob"] = canvas.after(60, runTotalAreaRedraw)
+
+        def closeTotalAreaWindow():
+            canvas = totalAreaState.get("canvas")
+            job = totalAreaState.get("redrawJob")
+            if canvas is not None and job is not None and canvas.winfo_exists():
+                try:
+                    canvas.after_cancel(job)
+                except Exception:
+                    pass
+
+            hideTotalAreaTooltip()
+            win = totalAreaState.get("win")
+            if win is not None and win.winfo_exists():
+                win.destroy()
+
+            totalAreaState["win"] = None
+            totalAreaState["canvas"] = None
+            totalAreaState["legendCanvas"] = None
+            totalAreaState["summaryBox"] = None
+            totalAreaState["subtitleLabel"] = None
+            totalAreaState["labels"] = {}
+            totalAreaState["redrawJob"] = None
+
+        def openTotalAreaWindow():
+            win = totalAreaState.get("win")
+            if win is not None and win.winfo_exists():
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+                refreshTotalAreaWindow()
+                return
+
+            win = tk.Toplevel(histWin)
+            win.configure(bg=self.bgColor)
+            win.title("Total Area Chart")
+            win.minsize(980, 560)
+            win.geometry("1180x680")
+            win.transient(histWin)
+
+            iconPath = resourcePath("hourglass.ico")
+            if os.path.exists(iconPath):
+                try:
+                    win.iconbitmap(iconPath)
+                except Exception:
+                    pass
+
+            win.columnconfigure(0, weight=1)
+            win.rowconfigure(1, weight=1)
+            win.rowconfigure(2, weight=0)
+            win.rowconfigure(3, weight=0)
+            win.rowconfigure(4, weight=0)
+
+            headerFrame = tk.Frame(win, bg=self.bgColor)
+            headerFrame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+            headerFrame.columnconfigure(0, weight=1)
+
+            titleLabel = tk.Label(
+                headerFrame,
+                text="Total History Area",
+                font=("Segoe UI", 11, "bold"),
+                fg=self.textColor,
+                bg=self.bgColor
+            )
+            titleLabel.grid(row=0, column=0, sticky="w")
+
+            subtitleLabel = tk.Label(
+                headerFrame,
+                text="Smoothed stacked area",
+                font=("Segoe UI", 9),
+                fg="#9ca3af",
+                bg=self.bgColor
+            )
+            subtitleLabel.grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+            chartFrame = tk.Frame(win, bg=self.bgColor)
+            chartFrame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
+            chartFrame.columnconfigure(0, weight=1)
+            chartFrame.rowconfigure(0, weight=1)
+
+            chartCanvas = tk.Canvas(
+                chartFrame,
+                bg="#1b1f24",
+                highlightthickness=0
+            )
+            chartCanvas.grid(row=0, column=0, sticky="nsew")
+
+            legendCanvas = tk.Canvas(
+                win,
+                height=32,
+                bg="#1b1f24",
+                highlightthickness=0
+            )
+            legendCanvas.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+            summaryBox = tk.Text(
+                win,
+                height=8,
+                bg="#1b1f24",
+                fg=self.textColor,
+                wrap="word",
+                borderwidth=0,
+                highlightthickness=0,
+                font=("Segoe UI", 10)
+            )
+            summaryBox.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+            closeFrame = tk.Frame(win, bg=self.bgColor)
+            closeFrame.grid(row=4, column=0, sticky="e", padx=10, pady=(0, 10))
+
+            closeTotalBtn = tk.Button(
+                closeFrame,
+                text="Close",
+                font=("Segoe UI", 10, "bold"),
+                bg="#1b1f24",
+                fg=self.textColor,
+                activebackground="#2c3440",
+                activeforeground=self.textColor,
+                relief="flat",
+                command=closeTotalAreaWindow
+            )
+            style_btn(closeTotalBtn)
+            closeTotalBtn.pack(anchor="e")
+
+            totalAreaState["win"] = win
+            totalAreaState["canvas"] = chartCanvas
+            totalAreaState["legendCanvas"] = legendCanvas
+            totalAreaState["summaryBox"] = summaryBox
+            totalAreaState["subtitleLabel"] = subtitleLabel
+            totalAreaState["labels"] = {}
+            totalAreaState["tooltip"] = {"win": None, "item": None}
+            totalAreaState["redrawJob"] = None
+
+            chartCanvas.bind("<Motion>", showTotalAreaTooltip)
+            chartCanvas.bind("<Leave>", hideTotalAreaTooltip)
+            chartCanvas.bind("<Configure>", scheduleTotalAreaRedraw)
+            legendCanvas.bind("<Configure>", scheduleTotalAreaRedraw)
+            win.protocol("WM_DELETE_WINDOW", closeTotalAreaWindow)
+            win.bind("<Escape>", lambda e: closeTotalAreaWindow())
+
+            win.update_idletasks()
+            refreshTotalAreaWindow(resetScroll=True)
+
         def showPayPeriodSummary():
             ppIdx = current["ppIndex"]
             if ppIdx < 0 or ppIdx >= len(periods):
                 ppSummaryBox.delete("1.0", tk.END)
                 ppPieCanvas.delete("all")
                 return
+
             p = periods[ppIdx]
             agg = p.get("agg", {})
             total = p.get("total", 0.0)
 
             computePayPeriodColorMap(agg)
+            isArea = (current.get("ppChartMode") == "area")
+            ppChartModeBtn.config(text=("Pie" if isArea else "Area"))
 
-            if current.get("ppChartMode") == "area":
+            if isArea:
                 drawPayPeriodStackedArea(p, agg)
             else:
                 drawPayPeriodPie(total, agg)
@@ -1161,8 +1648,6 @@ def openHistory(self):
 
         def togglePayPeriodChartMode():
             current["ppChartMode"] = "area" if current.get("ppChartMode") == "pie" else "pie"
-            isArea = (current.get("ppChartMode") == "area")
-            ppChartModeBtn.config(text=("Pie" if isArea else "Area"))
             showPayPeriodSummary()
 
 
@@ -1290,6 +1775,7 @@ def openHistory(self):
             self.saveData()
             refreshTaskList()
             showPayPeriodSummary()
+            refreshTotalAreaWindow()
             dayIdx = getSelectedDayIdx()
             if dayIdx is not None:
                 showDaySummary(dayIdx)
@@ -1304,9 +1790,16 @@ def openHistory(self):
                 self.saveData()
                 refreshTaskList()
                 showPayPeriodSummary()
+                refreshTotalAreaWindow()
                 dayIdx = getSelectedDayIdx()
                 if dayIdx is not None:
                     showDaySummary(dayIdx)
+
+        def closeHistoryWindow():
+            closeTotalAreaWindow()
+            if histWin.winfo_exists():
+                histWin.destroy()
+            self.histWin = None
 
         ppListbox.bind("<<ListboxSelect>>", onPayPeriodSelect)
         ppPieCanvas.bind("<Motion>", showPieTooltip)
@@ -1318,6 +1811,7 @@ def openHistory(self):
         setGroupBtn.config(command=setGroup)
         clearGroupBtn.config(command=clearGroup)
         ppChartModeBtn.config(command=togglePayPeriodChartMode)
+        totalAreaBtn.config(command=openTotalAreaWindow)
 
         btnFrame = tk.Frame(histWin, bg=self.bgColor)
         btnFrame.grid(row=1, column=0, columnspan=4, padx=8, pady=(0, 8), sticky="e")
@@ -1331,12 +1825,13 @@ def openHistory(self):
             activebackground="#2c3440",
             activeforeground=self.textColor,
             relief="flat",
-            command=histWin.destroy
+            command=closeHistoryWindow
         )
         style_btn(closeBtn)
         closeBtn.pack(anchor="e")
 
-        histWin.bind("<Escape>", lambda e: histWin.destroy())
+        histWin.protocol("WM_DELETE_WINDOW", closeHistoryWindow)
+        histWin.bind("<Escape>", lambda e: closeHistoryWindow())
 
         if periods:
             ppListbox.selection_set(0)

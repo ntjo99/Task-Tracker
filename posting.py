@@ -6,30 +6,81 @@ from datetime import date, datetime
 import requests
 import json
 
+def normalizeChargeCodeModel(model):
+    if not isinstance(model, dict):
+        return None
+
+    charge_code_id = (
+        model.get("chargeCodeId")
+        or model.get("chargeCodeID")
+        or model.get("CHARGECODEID")
+    )
+    charge_code_name = model.get("chargeCodeName")
+    charge_code_type = model.get("type")
+    hierarchical_name = model.get("hierarchicalName")
+    leave = model.get("leave")
+
+    normalized = {
+        "chargeCodeId": charge_code_id,
+        "chargeCodeName": charge_code_name,
+        "type": charge_code_type,
+        "hierarchicalName": hierarchical_name,
+        "leave": bool(leave) if leave is not None else False,
+    }
+
+    if not any(value not in (None, "", False) for value in normalized.values()):
+        return None
+
+    return normalized
+
+
+def chargeCodeModelSignature(model):
+    normalized = normalizeChargeCodeModel(model)
+    if normalized is None:
+        return None
+    return (
+        normalized.get("chargeCodeId"),
+        normalized.get("chargeCodeName"),
+        normalized.get("type"),
+        normalized.get("hierarchicalName"),
+        bool(normalized.get("leave")),
+    )
+
+
+def extractChargeCodeIdModelsFromTimesheetPayload(payload):
+    seen = set()
+    results = []
+    candidate_keys = {"chargecodeidmodels", "chargecodeidmodel", "chargecodes"}
+
+    def visit(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_lower = str(key).strip().lower()
+                if key_lower in candidate_keys and isinstance(value, list):
+                    for item in value:
+                        normalized = normalizeChargeCodeModel(item)
+                        if normalized is None:
+                            continue
+                        sig = chargeCodeModelSignature(normalized)
+                        if sig is None or sig in seen:
+                            continue
+                        seen.add(sig)
+                        results.append(normalized)
+                visit(value)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(payload)
+    return results
+
+
 def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
     tmpPath = path + ".tmp"
 
     def chunk4(arr):
         for i in range(0, len(arr), 4):
             yield arr[i:i + 4]
-
-    def normalizeModel(m):
-        if not isinstance(m, dict):
-            return None
-
-        ccId = m.get("chargeCodeId") or m.get("chargeCodeID") or m.get("chargeCodeId".upper())
-        name = m.get("chargeCodeName")
-        typ = m.get("type")
-        hier = m.get("hierarchicalName")
-        leave = m.get("leave")
-
-        return {
-            "chargeCodeId": ccId,
-            "chargeCodeName": name,
-            "type": typ,
-            "hierarchicalName": hier,
-            "leave": bool(leave) if leave is not None else False,
-        }
 
     def chunkSignature(chunk):
         ids = []
@@ -62,7 +113,7 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
 
     normalized = []
     for m in (chargeCodeIdModels or []):
-        nm = normalizeModel(m)
+        nm = normalizeChargeCodeModel(m)
         if nm is None:
             nm = {
                 "chargeCodeId": None,
@@ -345,13 +396,7 @@ def copyPreviousTimesheet(s, dateStr):
         if not timesheetId:
             raise RuntimeError("timesheet id missing from response")
 
-        chargeCodeIdModels = []
-
-        hoursWorked = data.get("hoursWorked", [])
-        for entry in hoursWorked:
-            models = entry.get("chargeCodeIDModels", [])
-            for m in models:
-                chargeCodeIdModels.append(m)
+        chargeCodeIdModels = extractChargeCodeIdModelsFromTimesheetPayload(data)
 
         return {
             "timesheetId": timesheetId,

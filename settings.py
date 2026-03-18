@@ -84,9 +84,30 @@ def loadChargeCodesFromJsonl(dataFile):
         pass
     return chunks
 
+
+def loadPostingEnv(baseDir):
+    envPath = os.path.join(baseDir, "posting.env")
+    values = {"BASE_URL": "", "EMAIL": "", "PASSWORD": ""}
+    if not os.path.exists(envPath):
+        return values
+    try:
+        with open(envPath, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                if key in values:
+                    values[key] = val.strip()
+    except Exception:
+        pass
+    return values
+
 def openSettings(app):
     settingsPath = os.path.join(app.getDataDir(), "settings.json")
     dataFile = app.realPath if hasattr(app, "realPath") else os.path.join(app.getDataDir(), "tasks.jsonl")
+    postingEnv = loadPostingEnv(app.getDataDir())
 
 
     def parseTimeHHMM(s, fallback):
@@ -371,6 +392,30 @@ def openSettings(app):
 
     row += 1
 
+    credentialsLabel = tk.Label(
+        generalFrame,
+        text="Timesheet login",
+        font=("Segoe UI", 10, "bold"),
+        fg=app.textColor,
+        bg=app.cardColor,
+        anchor="w"
+    )
+    credentialsLabel.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 4))
+
+    row += 1
+
+    credentialsHint = tk.Label(
+        generalFrame,
+        text="Saved locally. When these change, Save will verify the login in the background.",
+        font=("Segoe UI", 8),
+        fg="#9ca3af",
+        bg=app.cardColor,
+        anchor="w"
+    )
+    credentialsHint.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
+
+    row += 1
+
     baseUrlLabel = tk.Label(
         generalFrame,
         text="Base URL:",
@@ -381,7 +426,15 @@ def openSettings(app):
     )
     baseUrlLabel.grid(row=row, column=0, sticky="w", padx=12, pady=6)
 
-    baseUrlVar = tk.StringVar(value="")
+    existingBaseUrl = (postingEnv.get("BASE_URL") or "").strip()
+    initialUseDefaultBaseUrl = bool(settings.get("useDefaultBaseUrl", True))
+    initialCustomBaseUrl = ""
+    if existingBaseUrl and existingBaseUrl != DEFAULT_BASE_URL:
+        initialCustomBaseUrl = existingBaseUrl
+    elif not initialUseDefaultBaseUrl:
+        initialCustomBaseUrl = existingBaseUrl or DEFAULT_BASE_URL
+
+    baseUrlVar = tk.StringVar(value=initialCustomBaseUrl)
     baseUrlEntry = tk.Entry(
         generalFrame,
         textvariable=baseUrlVar,
@@ -409,7 +462,7 @@ def openSettings(app):
     )
     emailLabel.grid(row=row, column=0, sticky="w", padx=12, pady=6)
 
-    emailVar = tk.StringVar(value="")
+    emailVar = tk.StringVar(value=(postingEnv.get("EMAIL") or "").strip())
     emailEntry = tk.Entry(
         generalFrame,
         textvariable=emailVar,
@@ -437,7 +490,7 @@ def openSettings(app):
     )
     passwordLabel.grid(row=row, column=0, sticky="w", padx=12, pady=6)
 
-    passwordVar = tk.StringVar(value="")
+    passwordVar = tk.StringVar(value=postingEnv.get("PASSWORD") or "")
     passwordEntry = tk.Entry(
         generalFrame,
         textvariable=passwordVar,
@@ -456,12 +509,11 @@ def openSettings(app):
 
     row += 1
 
-    useDefaultBaseUrlVar = tk.IntVar(value=1 if settings.get("useDefaultBaseUrl", True) else 0)
+    useDefaultBaseUrlVar = tk.IntVar(value=1 if initialUseDefaultBaseUrl else 0)
     def applyBaseUrlState():
         if useDefaultBaseUrlVar.get():
             baseUrlLabel.grid_remove()
             baseUrlEntry.grid_remove()
-            baseUrlVar.set("")
         else:
             baseUrlLabel.grid()
             baseUrlEntry.grid()
@@ -482,7 +534,7 @@ def openSettings(app):
         activeforeground=app.textColor,
         selectcolor=app.cardColor,
         relief="flat",
-        command=applyBaseUrlState
+        command=lambda: (applyBaseUrlState(), refreshDirtyState())
     )
     useDefaultBaseUrlCb.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 12))
 
@@ -1005,6 +1057,7 @@ def openSettings(app):
 
         refreshTargetList(kind, name)
         refreshSelectionState()
+        refreshDirtyState()
 
     def clearSelectedManualColor():
         kind, name = selectedTarget()
@@ -1016,6 +1069,7 @@ def openSettings(app):
             groupColorOverrides.pop(name, None)
         refreshTargetList(kind, name)
         refreshSelectionState()
+        refreshDirtyState()
 
     def pickCustomColor():
         kind, name = selectedTarget()
@@ -1032,6 +1086,7 @@ def openSettings(app):
         groupColorOverrides.clear()
         refreshTargetList()
         refreshSelectionState()
+        refreshDirtyState()
 
     def renameSelectedTask():
         kind, oldName = selectedTarget()
@@ -1071,14 +1126,20 @@ def openSettings(app):
             if pendingTaskRenames.get(src) == src:
                 del pendingTaskRenames[src]
 
+        for var in chargeCodeVars.values():
+            if (var.get() or "").strip() == oldName:
+                var.set(newName)
+
         refreshTargetList("task", newName)
         refreshSelectionState()
+        rebuildChargeCodeTable()
+        refreshDirtyState()
 
     renameBtn.config(command=renameSelectedTask)
     autoColorBtn.config(command=clearSelectedManualColor)
     customColorBtn.config(command=pickCustomColor)
     clearOverridesBtn.config(command=clearAllOverrides)
-    palettePresetVar.trace_add("write", lambda *_: (refreshSwatches(), refreshSelectionState()))
+    palettePresetVar.trace_add("write", lambda *_: (refreshSwatches(), refreshSelectionState(), refreshDirtyState()))
     targetsList.bind("<<ListboxSelect>>", refreshSelectionState)
 
     refreshSwatches()
@@ -1113,14 +1174,17 @@ def openSettings(app):
     tableFrame.columnconfigure(0, weight=1)
     tableFrame.columnconfigure(1, weight=0)
 
-    # Build list of all ungrouped tasks + all groups
-    allGroups = sorted(set(app.groups.values())) if app.groups else []
-    ungroupedTasks = sorted([t for t in app.rows.keys() if t not in app.groups]) if hasattr(app, "rows") else []
-    taskGroupOptions = ["<None>"] + allGroups + ungroupedTasks
-
     chargeCodeVars = {}
     chargeCodeChunks = []
     removedChargeCodeIdxs = set()
+
+    def getTaskGroupOptions():
+        allGroups = sorted(set(workingGroupsByTask.values())) if workingGroupsByTask else []
+        ungroupedTasks = sorted(
+            [task for task in workingTaskNames if task not in workingGroupsByTask],
+            key=lambda s: s.lower()
+        )
+        return ["<None>"] + allGroups + ungroupedTasks
 
     def readGroupKeyForChunk(chunkIdx):
         try:
@@ -1141,6 +1205,7 @@ def openSettings(app):
 
     def rebuildChargeCodeTable():
         nonlocal chargeCodeChunks, chargeCodeVars
+        taskGroupOptions = getTaskGroupOptions()
 
         previousSelections = {
             idx: (var.get() or "").strip()
@@ -1209,6 +1274,7 @@ def openSettings(app):
             )
 
             chargeCodeVars[chunkIdx] = chunkVar
+            chunkVar.trace_add("write", lambda *_: refreshDirtyState())
             visibleRows += 1
 
             removeBtn = tk.Button(
@@ -1245,6 +1311,7 @@ def openSettings(app):
     def markChargeCodeForRemoval(chunkIdx):
         removedChargeCodeIdxs.add(chunkIdx)
         rebuildChargeCodeTable()
+        refreshDirtyState()
 
     def pullAndRefreshChargeCodes():
         if str(refreshBtn.cget("state")) == "disabled":
@@ -1275,6 +1342,7 @@ def openSettings(app):
                 def _refresh_table():
                     removedChargeCodeIdxs.clear()
                     rebuildChargeCodeTable()
+                    markChargeCodeStateSaved("Charge codes refreshed")
 
                 win.after(0, _refresh_table)
 
@@ -1319,8 +1387,14 @@ def openSettings(app):
         normal_bg = btn.cget("bg")
         hover = hover_bg or btn.cget("activebackground") or normal_bg
         btn.config(cursor="hand2")
-        btn.bind("<Enter>", lambda e: btn.config(bg=hover), add="+")
-        btn.bind("<Leave>", lambda e: btn.config(bg=normal_bg), add="+")
+        def on_enter(_event):
+            if str(btn.cget("state")) != "disabled":
+                btn.config(bg=hover)
+        def on_leave(_event):
+            if str(btn.cget("state")) != "disabled":
+                btn.config(bg=normal_bg)
+        btn.bind("<Enter>", on_enter, add="+")
+        btn.bind("<Leave>", on_leave, add="+")
 
     style_btn(refreshBtn)
     for b in (renameBtn, autoColorBtn, customColorBtn, clearOverridesBtn):
@@ -1341,29 +1415,222 @@ def openSettings(app):
     btnFrame = tk.Frame(win, bg=app.bgColor)
     btnFrame.pack(fill="x", padx=14, pady=(0, 12))
 
+    saveStateVar = tk.StringVar(value="All changes saved")
+    saveStateLabel = tk.Label(
+        btnFrame,
+        textvariable=saveStateVar,
+        font=("Segoe UI", 9),
+        fg="#9ca3af",
+        bg=app.bgColor,
+        anchor="w"
+    )
+    saveStateLabel.pack(side="left")
+
+    saveBtn = None
+    savedState = {"value": None}
+    saveInFlight = {"value": False}
+
+    def parseIntEntry(rawValue, fallback, minimum=0):
+        try:
+            value = int(str(rawValue).strip())
+        except Exception:
+            value = int(fallback or 0)
+        if value < minimum:
+            value = minimum
+        return value
+
+    def normalizeGroupKey(value):
+        groupKey = (value or "").strip()
+        if groupKey == "<None>":
+            return ""
+        return groupKey
+
+    def buildChargeCodeMappingState():
+        mappings = []
+        for chunkIdx, chunkCodes in enumerate(chargeCodeChunks):
+            codeIds = []
+            for code in (chunkCodes or []):
+                if isinstance(code, dict):
+                    codeIds.append(str(code.get("chargeCodeId") or ""))
+                else:
+                    codeIds.append("")
+
+            currentVar = chargeCodeVars.get(chunkIdx)
+            groupKey = ""
+            if currentVar is not None:
+                groupKey = normalizeGroupKey(currentVar.get())
+            else:
+                groupKey = normalizeGroupKey(readGroupKeyForChunk(chunkIdx))
+
+            mappings.append({
+                "chunkIndex": chunkIdx,
+                "codeIds": tuple(codeIds),
+                "groupKey": groupKey,
+                "removed": chunkIdx in removedChargeCodeIdxs,
+            })
+        return mappings
+
+    def buildCurrentState():
+        start = parseTimeHHMM(workStartVar.get(), settings.get("workDayStart", "09:00"))
+        end = parseTimeHHMM(workEndVar.get(), settings.get("workDayEnd", "17:00"))
+        minMinutes = parseIntEntry(minMinutesVar.get(), settings.get("minRecordedMinutes", 1), minimum=0)
+        width = parseIntEntry(mainWidthVar.get(), settings.get("mainWindowWidth", 400), minimum=250)
+        height = parseIntEntry(mainHeightVar.get(), settings.get("mainWindowHeight", 400), minimum=250)
+        useDefaultBaseUrl = bool(useDefaultBaseUrlVar.get())
+        customBaseUrl = baseUrlVar.get().strip()
+        effectiveBaseUrl = DEFAULT_BASE_URL if useDefaultBaseUrl else customBaseUrl
+
+        renamePairs = [
+            (src, dst)
+            for src, dst in pendingTaskRenames.items()
+            if src and dst and src != dst
+        ]
+        renamePairs.sort(key=lambda kv: kv[0].lower())
+
+        return {
+            "settings": {
+                "workDayStart": start,
+                "workDayEnd": end,
+                "minRecordedMinutes": minMinutes,
+                "roundToHours": bool(roundToHoursVar.get()),
+                "useTimesheetFunctions": bool(useTimesheetVar.get()),
+                "autoChargeCodes": bool(autoChargeCodesVar.get()),
+                "reviewBeforePost": bool(reviewBeforePostVar.get()),
+                "useDefaultBaseUrl": useDefaultBaseUrl,
+                "mainWindowWidth": width,
+                "mainWindowHeight": height,
+                "colorPalettePreset": str(palettePresetVar.get().lower() or "classic").strip().lower(),
+                "selectedTaskUsesColor": bool(selectedTaskUsesColorVar.get()),
+                "taskColorOverrides": dict(sorted(normalizeColorMap(taskColorOverrides).items(), key=lambda kv: kv[0].lower())),
+                "groupColorOverrides": dict(sorted(normalizeColorMap(groupColorOverrides).items(), key=lambda kv: kv[0].lower())),
+            },
+            "credentials": {
+                "baseUrl": effectiveBaseUrl.strip(),
+                "customBaseUrl": customBaseUrl,
+                "email": emailVar.get().strip(),
+                "password": passwordVar.get().strip(),
+            },
+            "renamePairs": renamePairs,
+            "chargeMappings": buildChargeCodeMappingState(),
+        }
+
+    def setSaveStatus(message, error=False):
+        saveStateVar.set(message)
+        saveStateLabel.config(fg="#d77c7c" if error else "#9ca3af")
+
+    def updateSaveButtonState():
+        if saveBtn is None:
+            return
+        dirty = savedState["value"] is None or buildCurrentState() != savedState["value"]
+        enabled = dirty and not saveInFlight["value"]
+        if enabled:
+            saveBtn.config(
+                state="normal",
+                bg=app.accentColor,
+                fg="#ffffff",
+                activebackground="#5b98ff",
+                activeforeground="#ffffff",
+                disabledforeground="#d7dde6"
+            )
+        else:
+            saveBtn.config(
+                state="disabled",
+                bg="#55606d",
+                fg="#d7dde6",
+                activebackground="#55606d",
+                activeforeground="#d7dde6",
+                disabledforeground="#d7dde6"
+            )
+
+    def refreshDirtyState(*_args):
+        dirty = savedState["value"] is None or buildCurrentState() != savedState["value"]
+        if not saveInFlight["value"]:
+            if dirty:
+                setSaveStatus("Unsaved changes")
+            else:
+                setSaveStatus("All changes saved")
+        updateSaveButtonState()
+        return dirty
+
+    def markCurrentStateSaved(message="All changes saved"):
+        savedState["value"] = buildCurrentState()
+        saveInFlight["value"] = False
+        setSaveStatus(message)
+        updateSaveButtonState()
+
+    def markChargeCodeStateSaved(message="Charge codes refreshed"):
+        currentState = buildCurrentState()
+        if savedState["value"] is None:
+            savedState["value"] = currentState
+        else:
+            savedState["value"]["chargeMappings"] = currentState.get("chargeMappings", [])
+        saveInFlight["value"] = False
+        if buildCurrentState() == savedState["value"]:
+            setSaveStatus(message)
+        else:
+            setSaveStatus("Unsaved changes")
+        updateSaveButtonState()
+
+    def runCredentialLoginCheck(displayEmail):
+        def job():
+            postingModule = None
+            session = None
+            try:
+                import importlib
+                import posting
+
+                postingModule = importlib.reload(posting)
+                session = postingModule.newSession()
+                postingModule.primeCookies(session)
+                _, loginJson = postingModule.login(session)
+                try:
+                    postingModule.extractEmployeeId(loginJson)
+                except Exception:
+                    pass
+                if postingModule is not None and session is not None:
+                    postingModule.saveCookies(session)
+                msg = "Login successful"
+                if displayEmail:
+                    msg = f"{msg} for {displayEmail}"
+                if hasattr(app, "showToast"):
+                    app.root.after(0, lambda: app.showToast(msg))
+                else:
+                    app.root.after(0, lambda: messagebox.showinfo("Login successful", msg))
+            except Exception as e:
+                msg = f"Settings saved, but login failed: {e}"
+                if hasattr(app, "showToast"):
+                    app.root.after(0, lambda: app.showToast(msg, timeout=6000, error=True))
+                else:
+                    app.root.after(0, lambda: messagebox.showerror("Login failed", msg))
+            finally:
+                if postingModule is not None and session is not None:
+                    try:
+                        postingModule.saveCookies(session)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=job, daemon=True).start()
+
     def saveSettings():
+        if saveInFlight["value"]:
+            return
+
+        previousState = savedState["value"]
+        currentState = buildCurrentState()
+        if previousState is not None and currentState == previousState:
+            markCurrentStateSaved()
+            return
+
+        saveInFlight["value"] = True
+        setSaveStatus("Saving...")
+        updateSaveButtonState()
+
         start = parseTimeHHMM(workStartVar.get(), settings.get("workDayStart", "09:00"))
         end = parseTimeHHMM(workEndVar.get(), settings.get("workDayEnd", "17:00"))
 
-        try:
-            m = int(minMinutesVar.get().strip())
-            if m < 0:
-                m = 0
-        except Exception:
-            m = int(settings.get("minRecordedMinutes", 1) or 1)
-
-        try:
-            w = int(mainWidthVar.get().strip())
-        except Exception:
-            w = int(settings.get("mainWindowWidth", 400) or 400)
-
-        try:
-            h = int(mainHeightVar.get().strip())
-        except Exception:
-            h = int(settings.get("mainWindowHeight", 400) or 400)
-
-        w = max(250, w)
-        h = max(250, h)
+        m = parseIntEntry(minMinutesVar.get(), settings.get("minRecordedMinutes", 1), minimum=0)
+        w = parseIntEntry(mainWidthVar.get(), settings.get("mainWindowWidth", 400), minimum=250)
+        h = parseIntEntry(mainHeightVar.get(), settings.get("mainWindowHeight", 400), minimum=250)
 
         settings["workDayStart"] = start
         settings["workDayEnd"] = end
@@ -1392,6 +1659,9 @@ def openSettings(app):
         for oldName, newName in renamePairs:
             ok, msg = app.renameTask(oldName, newName, persist=False)
             if not ok:
+                saveInFlight["value"] = False
+                updateSaveButtonState()
+                setSaveStatus("Save failed", error=True)
                 messagebox.showerror("Rename Task", msg or f"Unable to rename '{oldName}' to '{newName}'.")
                 return
             renamedAny = True
@@ -1412,6 +1682,9 @@ def openSettings(app):
         if renamedAny:
             if hasattr(app, "rewrite_data_file"):
                 if not app.rewrite_data_file():
+                    saveInFlight["value"] = False
+                    updateSaveButtonState()
+                    setSaveStatus("Save failed", error=True)
                     messagebox.showerror("Save Failed", "Renamed tasks were applied in memory, but history could not be rewritten to disk.")
                     return
             else:
@@ -1424,12 +1697,10 @@ def openSettings(app):
         if useDefaultBaseUrlVar.get():
             baseUrlVal = DEFAULT_BASE_URL
 
-        if baseUrlVal or emailVal or passwordVal:
-            updatePostingEnv(app.getDataDir(), baseUrlVal, emailVal, passwordVal)
-            # Reload posting module to get updated env vars
-            import importlib
-            import posting
-            importlib.reload(posting)
+        updatePostingEnv(app.getDataDir(), baseUrlVal, emailVal, passwordVal)
+        import importlib
+        import posting
+        importlib.reload(posting)
 
         app.settings = settings
         app.minSegmentSeconds = int(m * 60)
@@ -1452,7 +1723,29 @@ def openSettings(app):
         if hasattr(app, "refreshRowStyles"):
             app.refreshRowStyles()
 
-        win.destroy()
+        if renamePairs:
+            pendingTaskRenames.clear()
+            originalTaskNames.clear()
+            originalTaskNames.update(workingTaskNames)
+
+        removedChargeCodeIdxs.clear()
+        rebuildChargeCodeTable()
+        refreshTargetList()
+        refreshSelectionState()
+
+        credentialsChanged = previousState is None or currentState.get("credentials") != previousState.get("credentials")
+        shouldCheckLogin = bool(credentialsChanged and baseUrlVal and emailVal and passwordVal)
+
+        if hasattr(app, "showToast"):
+            if shouldCheckLogin:
+                app.showToast("Settings saved. Verifying login...", timeout=3500)
+            else:
+                app.showToast("Settings saved")
+
+        markCurrentStateSaved()
+
+        if shouldCheckLogin:
+            runCredentialLoginCheck(emailVal)
 
     saveBtn = tk.Button(
         btnFrame,
@@ -1468,24 +1761,55 @@ def openSettings(app):
     style_btn(saveBtn, hover_bg="#5b98ff")
     saveBtn.pack(side="right")
 
-    cancelBtn = tk.Button(
+    closeBtn = tk.Button(
         btnFrame,
-        text="Cancel",
+        text="Close",
         font=("Segoe UI", 10),
         bg="#1b1f24",
         fg=app.textColor,
         activebackground="#2c3440",
         activeforeground=app.textColor,
         relief="flat",
-        command=win.destroy
+        command=lambda: onCloseSettings()
     )
-    style_btn(cancelBtn)
-    cancelBtn.pack(side="right", padx=(0, 8))
+    style_btn(closeBtn)
+    closeBtn.pack(side="right", padx=(0, 8))
 
-    win.bind("<Escape>", lambda e: win.destroy())
+    def onCloseSettings():
+        if refreshDirtyState():
+            discard = messagebox.askyesno(
+                "Unsaved Changes",
+                "You have unsaved changes in Settings.\n\nClose without saving?"
+            )
+            if not discard:
+                return
+        win.destroy()
+
+    trackedVars = [
+        workStartVar,
+        workEndVar,
+        minMinutesVar,
+        mainWidthVar,
+        mainHeightVar,
+        baseUrlVar,
+        emailVar,
+        passwordVar,
+        useDefaultBaseUrlVar,
+        roundToHoursVar,
+        useTimesheetVar,
+        autoChargeCodesVar,
+        reviewBeforePostVar,
+        selectedTaskUsesColorVar,
+    ]
+    for trackedVar in trackedVars:
+        trackedVar.trace_add("write", refreshDirtyState)
+
+    win.protocol("WM_DELETE_WINDOW", onCloseSettings)
+    win.bind("<Escape>", lambda e: onCloseSettings())
     workStartEntry.focus_set()
 
     applyBaseUrlState()
+    markCurrentStateSaved()
 
 
 def updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars, removedChargeCodeIdxs=None):
@@ -1543,8 +1867,8 @@ def updateChargeCodesInJsonl(dataFile, chargeCodeChunks, chargeCodeVars, removed
         import traceback
         traceback.print_exc()
 
-def updatePostingEnv(baseDir, baseUrl="", email="", password=""):
-    """Update posting.env with provided credentials, keeping existing values if not provided"""
+def updatePostingEnv(baseDir, baseUrl=None, email=None, password=None):
+    """Update posting.env with exact values supplied by the settings form."""
     try:
         os.makedirs(baseDir, exist_ok=True)
     except Exception:
@@ -1569,12 +1893,12 @@ def updatePostingEnv(baseDir, baseUrl="", email="", password=""):
         except Exception:
             pass
     
-    # Update with provided values (only if non-empty)
-    if baseUrl:
+    # Update with provided values exactly so clearing a field in Settings clears it on disk too.
+    if baseUrl is not None:
         existing["BASE_URL"] = baseUrl
-    if email:
+    if email is not None:
         existing["EMAIL"] = email
-    if password:
+    if password is not None:
         existing["PASSWORD"] = password
     
     # Write back to file

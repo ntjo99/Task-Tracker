@@ -137,8 +137,7 @@ class TaskTrackerApp:
         self.updateLoop()
 
         self.root.bind("<Delete>", self.deleteSelected)
-        self.root.bind("<g>", self.startGeneralTask)
-        self.root.bind("<G>", self.startGeneralTask)
+        self.root.bind("<KeyPress>", self.startGeneralTask)
         self.root.protocol("WM_DELETE_WINDOW", self.onClose)
 
     def _clamp01(self, x):
@@ -849,7 +848,7 @@ class TaskTrackerApp:
         return "break"
 
     def startGeneralTask(self, event=None):
-        # Only trigger when the app window is focused and the user isn't typing in an entry.
+        # Global letter hotkey: start the topmost task whose name starts with that letter.
         try:
             if self.root.focus_displayof() is None:
                 return
@@ -858,9 +857,31 @@ class TaskTrackerApp:
                 return
         except Exception:
             return
-        name = "General"
-        if name in self.rows:
-            self.startTask(name)
+
+        if event is None:
+            return
+
+        try:
+            state = int(getattr(event, "state", 0) or 0)
+        except Exception:
+            state = 0
+
+        # Ignore modified key presses so app shortcuts like Ctrl+K still work.
+        if (state & 0x0004) or (state & 0x0008) or (state & 0x20000):
+            return
+
+        ch = str(getattr(event, "char", "") or "")
+        if len(ch) != 1 or not ch.isalpha():
+            return
+
+        targetLetter = ch.casefold()
+        for name in self.rows.keys():
+            taskName = str(name or "").strip()
+            if not taskName:
+                continue
+            if taskName[0].casefold() == targetLetter:
+                self.startTask(name)
+                return "break"
 
     def loadData(self):
         if not os.path.exists(self.dataFile):
