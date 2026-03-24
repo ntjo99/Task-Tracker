@@ -848,7 +848,7 @@ class TaskTrackerApp:
         return "break"
 
     def startGeneralTask(self, event=None):
-        # Global letter hotkey: start the topmost task whose name starts with that letter.
+        # Global letter hotkey: start the highest-ordered task whose name starts with that letter.
         try:
             if self.root.focus_displayof() is None:
                 return
@@ -875,7 +875,7 @@ class TaskTrackerApp:
             return
 
         targetLetter = ch.casefold()
-        for name in self.rows.keys():
+        for name in reversed(list(self.rows.keys())):
             taskName = str(name or "").strip()
             if not taskName:
                 continue
@@ -1362,6 +1362,25 @@ class TaskTrackerApp:
             return datetime.fromtimestamp(nowTs).date().isoformat()
         except Exception:
             return date.today().isoformat()
+
+    def _syncIdleActiveDayKey(self, now=None):
+        if now is None:
+            now = time.time()
+
+        if self.currentTask is not None or self.currentStart is not None:
+            return
+        if self.unassignedStart is not None:
+            return
+        if bool(self.hasUnsavedTime):
+            return
+        if float(self.unassignedSeconds or 0.0) > 0.0:
+            return
+        if any(float(seconds or 0.0) > 0.0 for seconds in self.tasks.values()):
+            return
+        if self.dayTimeline:
+            return
+
+        self.activeDayKey = self._currentDateKey(now)
 
     def _saveTimelineForDate(self, dateKey, sourceTimeline, mergeChoice="append"):
         incomingTimeline = list(sourceTimeline or [])
@@ -1968,6 +1987,8 @@ class TaskTrackerApp:
         if self.dragTaskName is not None:
             return
 
+        self._syncIdleActiveDayKey(now)
+
         self._closeActiveSegment(now)
 
         if self.currentTask == name:
@@ -2071,6 +2092,7 @@ class TaskTrackerApp:
 
     def updateLoop(self):
         now = time.time()
+        self._syncIdleActiveDayKey(now)
 
         pendingPosts = []
         try:

@@ -1,6 +1,6 @@
 from datetime import date, timedelta, datetime
 import tkinter as tk
-from tkinter import messagebox, font as tkfont
+from tkinter import messagebox, simpledialog, font as tkfont
 import sys
 import os
 import openEdit
@@ -27,40 +27,38 @@ def resourcePath(relPath):
 
 def openHistory(self):
         self.loadData()
-        if not self.history:
-            messagebox.showinfo("History", "No summaries saved yet.")
-            return
 
         anchorStart = date(2025, 11, 29)
-        ppMap = {}
 
-        for dStr in self.history.keys():
-            try:
-                d = date.fromisoformat(dStr)
-            except ValueError:
-                continue
-            offset = (d - anchorStart).days
-            idx = offset // 14
-            ppStart = anchorStart + timedelta(days=idx * 14)
-            ppEnd = ppStart + timedelta(days=13)
-            key = (ppStart, ppEnd)
-            if key not in ppMap:
-                ppMap[key] = []
-            ppMap[key].append(dStr)
+        def buildPeriodsFromHistory():
+            ppMap = {}
 
-        if not ppMap:
-            messagebox.showinfo("History", "No valid dated summaries.")
-            return
+            for dStr in self.history.keys():
+                try:
+                    d = date.fromisoformat(dStr)
+                except ValueError:
+                    continue
+                offset = (d - anchorStart).days
+                idx = offset // 14
+                ppStart = anchorStart + timedelta(days=idx * 14)
+                ppEnd = ppStart + timedelta(days=13)
+                key = (ppStart, ppEnd)
+                if key not in ppMap:
+                    ppMap[key] = []
+                ppMap[key].append(dStr)
 
-        periods = []
-        for (start, end), days in ppMap.items():
-            daysSorted = sorted(days, reverse=True)
-            periods.append({
-                "start": start,
-                "end": end,
-                "days": daysSorted
-            })
-        periods.sort(key=lambda p: p["start"], reverse=True)
+            periodsLocal = []
+            for (start, end), days in ppMap.items():
+                daysSorted = sorted(days, reverse=True)
+                periodsLocal.append({
+                    "start": start,
+                    "end": end,
+                    "days": daysSorted
+                })
+            periodsLocal.sort(key=lambda p: p["start"], reverse=True)
+            return periodsLocal
+
+        periods = buildPeriodsFromHistory()
 
         def _parseTimeToSeconds(ts): # Need this so that I don't get timezone confusion
             try:
@@ -165,8 +163,10 @@ def openHistory(self):
         recomputeTotalOverview()
 
         # helper to recompute period aggregates after edits
-        def updatePeriods():
-            nonlocal periods
+        def updatePeriods(preferredDayKey=None):
+            previousDayKey = preferredDayKey if preferredDayKey is not None else current.get("dayKey")
+            periods[:] = buildPeriodsFromHistory()
+
             for p in periods:
                 agg = {}
                 total = 0.0
@@ -178,9 +178,44 @@ def openHistory(self):
                 p["agg"] = agg
                 p["total"] = total
             recomputeTotalOverview()
-            # ensure UI shows recalculated data
+
+            if periods:
+                selectedPpIdx = None
+                if previousDayKey:
+                    for idx, period in enumerate(periods):
+                        if previousDayKey in period.get("days", []):
+                            selectedPpIdx = idx
+                            break
+                if selectedPpIdx is None:
+                    try:
+                        selectedPpIdx = int(current.get("ppIndex", 0))
+                    except Exception:
+                        selectedPpIdx = 0
+                    selectedPpIdx = max(0, min(selectedPpIdx, len(periods) - 1))
+                current["ppIndex"] = selectedPpIdx
+            else:
+                current["ppIndex"] = -1
+                current["dayKey"] = None
+
             try:
-                showPayPeriodSummary()
+                refreshTaskList()
+            except Exception:
+                pass
+            try:
+                ppListbox.delete(0, tk.END)
+                for period in periods:
+                    start = period["start"]
+                    end = period["end"]
+                    label = f"{start.strftime('%b %d')} - {end.strftime('%b %d, %Y')}"
+                    ppListbox.insert(tk.END, label)
+                if periods:
+                    ppListbox.selection_clear(0, tk.END)
+                    ppListbox.selection_set(current["ppIndex"])
+                    ppListbox.see(current["ppIndex"])
+            except Exception:
+                pass
+            try:
+                refreshDays(preferredDayKey=previousDayKey)
             except Exception:
                 pass
             try:
@@ -265,14 +300,40 @@ def openHistory(self):
 
         dayFrame = tk.Frame(histWin, bg=self.bgColor)
         dayFrame.grid(row=0, column=1, padx=8, pady=8, sticky="ns")
+        dayHeaderFrame = tk.Frame(dayFrame, bg=self.bgColor)
+        dayHeaderFrame.pack(fill="x")
         dayLabel = tk.Label(
-            dayFrame,
+            dayHeaderFrame,
             text="Days",
             font=("Segoe UI", 10, "bold"),
             fg=self.textColor,
             bg=self.bgColor
         )
-        dayLabel.pack(anchor="w")
+        dayLabel.pack(side="left", anchor="w")
+
+        addDayBtn = tk.Button(
+            dayHeaderFrame,
+            text="Add Day",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat"
+        )
+        addDayBtn.pack(side="right")
+
+        deleteDayBtn = tk.Button(
+            dayHeaderFrame,
+            text="Delete",
+            font=("Segoe UI", 9),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat"
+        )
+        deleteDayBtn.pack(side="right", padx=(0, 6))
 
         dayListbox = tk.Listbox(
             dayFrame,
@@ -340,14 +401,7 @@ def openHistory(self):
             fg=self.textColor,
             activebackground="#2c3440",
             activeforeground=self.textColor,
-            relief="flat",
-            # pass the available task list so the editor can show a row for every task
-            command=lambda: openEdit.open_day_editor(
-                self, histWin, current.get("dayKey"), periods, current,
-                showPayPeriodSummary, refreshDays, showDaySummary, ppColorMap,
-                updatePeriods,
-                sorted(set(list(self.rows.keys()) + list(allTasks)))
-            )
+            relief="flat"
         )
         editDayBtn.pack(side="right", padx=(0,10))
 
@@ -523,7 +577,7 @@ def openHistory(self):
             btn.bind("<Enter>", lambda e: btn.config(bg=hover), add="+")
             btn.bind("<Leave>", lambda e: btn.config(bg=normal_bg), add="+")
 
-        for b in (timelineModeBtn, editDayBtn, ppChartModeBtn, totalAreaBtn, setGroupBtn, clearGroupBtn):
+        for b in (addDayBtn, deleteDayBtn, timelineModeBtn, editDayBtn, ppChartModeBtn, totalAreaBtn, setGroupBtn, clearGroupBtn):
             style_btn(b)
 
         current = {"ppIndex": 0, "timelineMode": "gantt", "ppChartMode": "pie", "dayKey": None}
@@ -1654,12 +1708,14 @@ def openHistory(self):
         def showDaySummary(dayIdx):
             ppIdx = current["ppIndex"]
             if ppIdx < 0 or ppIdx >= len(periods):
+                current["dayKey"] = None
                 daySummaryBox.delete("1.0", tk.END)
                 timelineCanvas.delete("all")
                 return
 
             period = periods[ppIdx]
             if dayIdx < 0 or dayIdx >= len(period["days"]):
+                current["dayKey"] = None
                 daySummaryBox.delete("1.0", tk.END)
                 timelineCanvas.delete("all")
                 return
@@ -1720,12 +1776,14 @@ def openHistory(self):
                 return None
             return sel[0]
 
-        def refreshDays():
+        def refreshDays(preferredDayKey=None):
             dayListbox.delete(0, tk.END)
             ppIdx = current["ppIndex"]
             if ppIdx < 0 or ppIdx >= len(periods):
+                current["dayKey"] = None
                 daySummaryBox.delete("1.0", tk.END)
                 timelineCanvas.delete("all")
+                showPayPeriodSummary()
                 return
             period = periods[ppIdx]
             for dStr in period["days"]:
@@ -1737,12 +1795,106 @@ def openHistory(self):
                 dayListbox.insert(tk.END, label)
             showPayPeriodSummary()
             if period["days"]:
+                selectedDayKey = preferredDayKey if preferredDayKey is not None else current.get("dayKey")
+                dayIdx = 0
+                if selectedDayKey in period["days"]:
+                    dayIdx = period["days"].index(selectedDayKey)
                 dayListbox.selection_clear(0, tk.END)
-                dayListbox.selection_set(0)
-                showDaySummary(0)
+                dayListbox.selection_set(dayIdx)
+                dayListbox.see(dayIdx)
+                showDaySummary(dayIdx)
             else:
+                current["dayKey"] = None
                 daySummaryBox.delete("1.0", tk.END)
                 timelineCanvas.delete("all")
+
+        def editSelectedDay():
+            dayKey = current.get("dayKey")
+            if not dayKey:
+                messagebox.showinfo("Edit Day", "Add or select a day first.")
+                return
+            openEdit.open_day_editor(
+                self, histWin, dayKey, periods, current,
+                showPayPeriodSummary, refreshDays, showDaySummary, ppColorMap,
+                updatePeriods,
+                sorted(set(list(self.rows.keys()) + list(collectAllTasks())))
+            )
+
+        def promptForDayKey(initialValue=None):
+            seed = initialValue or current.get("dayKey") or date.today().isoformat()
+            while True:
+                raw = simpledialog.askstring(
+                    "Add Day",
+                    "Enter date (YYYY-MM-DD):",
+                    initialvalue=seed,
+                    parent=histWin
+                )
+                if raw is None:
+                    return None
+                dayKey = str(raw).strip()
+                if not dayKey:
+                    messagebox.showerror("Invalid Date", "Enter a date like 2026-03-24.")
+                    continue
+                try:
+                    date.fromisoformat(dayKey)
+                    return dayKey
+                except ValueError:
+                    messagebox.showerror("Invalid Date", "Use YYYY-MM-DD.")
+                    seed = dayKey
+
+        def addDay():
+            dayKey = promptForDayKey()
+            if dayKey is None:
+                return
+            if dayKey in self.history:
+                updatePeriods(preferredDayKey=dayKey)
+                messagebox.showinfo("Day Exists", f"{dayKey} is already in history.")
+                return
+
+            self.history[dayKey] = {"summary": "Total: 0.0 h", "timeline": []}
+            if not bool(self.rewrite_data_file()):
+                self.history.pop(dayKey, None)
+                messagebox.showerror("Add Day", f"Couldn't save {dayKey}.")
+                return
+
+            updatePeriods(preferredDayKey=dayKey)
+
+        def deleteSelectedDay():
+            dayKey = current.get("dayKey")
+            if not dayKey:
+                messagebox.showinfo("Delete Day", "Select a day to delete.")
+                return
+            if not messagebox.askyesno(
+                "Delete Day",
+                f"Delete saved summary/timeline for {dayKey}?\n\nThis cannot be undone."
+            ):
+                return
+
+            fallbackDayKey = None
+            ppIdx = current.get("ppIndex", -1)
+            if 0 <= ppIdx < len(periods):
+                periodDays = list(periods[ppIdx].get("days", []))
+                if dayKey in periodDays:
+                    idx = periodDays.index(dayKey)
+                    remaining = periodDays[:idx] + periodDays[idx + 1:]
+                    if remaining:
+                        fallbackDayKey = remaining[min(idx, len(remaining) - 1)]
+            if fallbackDayKey is None:
+                remainingAll = sorted((d for d in self.history.keys() if d != dayKey), reverse=True)
+                if remainingAll:
+                    fallbackDayKey = remainingAll[0]
+
+            priorEntry = self.history.get(dayKey)
+            if dayKey in self.history:
+                del self.history[dayKey]
+
+            if not bool(self.rewrite_data_file()):
+                if priorEntry is not None:
+                    self.history[dayKey] = priorEntry
+                messagebox.showerror("Delete Day", f"Couldn't delete {dayKey}.")
+                return
+
+            updatePeriods(preferredDayKey=fallbackDayKey)
 
         def onPayPeriodSelect(event):
             sel = ppListbox.curselection()
@@ -1808,6 +1960,9 @@ def openHistory(self):
         timelineCanvas.bind("<Leave>", hideTooltip)
         dayListbox.bind("<<ListboxSelect>>", onDaySelect)
         taskListbox.bind("<<ListboxSelect>>", onTaskSelect)
+        addDayBtn.config(command=addDay)
+        deleteDayBtn.config(command=deleteSelectedDay)
+        editDayBtn.config(command=editSelectedDay)
         setGroupBtn.config(command=setGroup)
         clearGroupBtn.config(command=clearGroup)
         ppChartModeBtn.config(command=togglePayPeriodChartMode)
@@ -1833,8 +1988,4 @@ def openHistory(self):
         histWin.protocol("WM_DELETE_WINDOW", closeHistoryWindow)
         histWin.bind("<Escape>", lambda e: closeHistoryWindow())
 
-        if periods:
-            ppListbox.selection_set(0)
-            current["ppIndex"] = 0
-            refreshDays()
-            refreshTaskList()
+        updatePeriods()

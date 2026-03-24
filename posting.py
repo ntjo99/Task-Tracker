@@ -1,10 +1,20 @@
 import os
 import sys
 from http.cookiejar import MozillaCookieJar
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import date, datetime
 import requests
 import json
+
+def blankChargeCodeModel():
+    return {
+        "chargeCodeId": None,
+        "chargeCodeName": None,
+        "type": None,
+        "hierarchicalName": None,
+        "leave": False,
+    }
+
 
 def normalizeChargeCodeModel(model):
     if not isinstance(model, dict):
@@ -34,6 +44,133 @@ def normalizeChargeCodeModel(model):
     return normalized
 
 
+def hasChargeCodeValue(model):
+    if not isinstance(model, dict):
+        return False
+    return any(
+        model.get(key) not in (None, "", False)
+        for key in ("chargeCodeId", "chargeCodeName", "hierarchicalName")
+    ) or bool(model.get("leave"))
+
+
+def inferChargeCodeSlot(model):
+    if not isinstance(model, dict):
+        return None
+
+    kind = str(model.get("type") or "").strip().casefold().replace("_", " ")
+    if kind == "customer":
+        return 0
+    if kind == "job":
+        return 1
+    if kind == "service item":
+        return 2
+    if kind == "class":
+        return 3
+    return None
+
+
+def normalizeChargeCodeChunk(rawChunk, blankServiceItems=True):
+    chunk = [blankChargeCodeModel() for _ in range(4)]
+    deferred = []
+
+    if not isinstance(rawChunk, list):
+        return chunk
+
+    for rawIndex, item in enumerate(rawChunk):
+        normalized = normalizeChargeCodeModel(item)
+        if normalized is None:
+            normalized = blankChargeCodeModel()
+
+        slot = inferChargeCodeSlot(normalized)
+        if slot is not None and not hasChargeCodeValue(chunk[slot]):
+            chunk[slot] = normalized
+            continue
+
+        deferred.append((rawIndex, normalized))
+
+    for rawIndex, normalized in deferred:
+        preferredSlots = []
+        if 0 <= rawIndex < 4:
+            preferredSlots.append(rawIndex)
+        preferredSlots.extend(slot for slot in range(4) if slot not in preferredSlots)
+
+        for slot in preferredSlots:
+            if not hasChargeCodeValue(chunk[slot]):
+                chunk[slot] = normalized
+                break
+
+    if blankServiceItems:
+        chunk[2] = blankChargeCodeModel()
+
+    return chunk
+
+
+def chunkHasChargeCodeValue(chunk):
+    if not isinstance(chunk, list):
+        return False
+    return any(hasChargeCodeValue(item) for item in chunk if isinstance(item, dict))
+
+
+def splitChargeCodeModelsIntoChunks(models):
+    chunks = []
+    current = []
+    currentSlots = set()
+    currentHasValue = False
+
+    def flushCurrent():
+        nonlocal current, currentSlots, currentHasValue
+        if not current:
+            return
+        chunk = normalizeChargeCodeChunk(current)
+        if chunkHasChargeCodeValue(chunk):
+            chunks.append(chunk)
+        current = []
+        currentSlots = set()
+        currentHasValue = False
+
+    if not isinstance(models, list):
+        return chunks
+
+    if models and all(isinstance(item, list) for item in models):
+        for sub in models:
+            chunk = normalizeChargeCodeChunk(sub)
+            if chunkHasChargeCodeValue(chunk):
+                chunks.append(chunk)
+        return chunks
+
+    for item in models:
+        if isinstance(item, list):
+            flushCurrent()
+            chunk = normalizeChargeCodeChunk(item)
+            if chunkHasChargeCodeValue(chunk):
+                chunks.append(chunk)
+            continue
+
+        normalized = normalizeChargeCodeModel(item)
+        slot = inferChargeCodeSlot(normalized) if normalized is not None else None
+        shouldFlush = False
+
+        if current:
+            if slot == 0 and currentHasValue:
+                shouldFlush = True
+            elif slot is not None and slot in currentSlots and currentHasValue:
+                shouldFlush = True
+            elif len(current) >= 4:
+                shouldFlush = True
+
+        if shouldFlush:
+            flushCurrent()
+
+        current.append(item)
+        if slot is not None:
+            currentSlots.add(slot)
+        if normalized is not None and hasChargeCodeValue(normalized):
+            currentHasValue = True
+
+    flushCurrent()
+    return chunks
+
+
 def chargeCodeModelSignature(model):
     normalized = normalizeChargeCodeModel(model)
     if normalized is None:
@@ -47,60 +184,60 @@ def chargeCodeModelSignature(model):
     )
 
 
-def extractChargeCodeIdModelsFromTimesheetPayload(payload):
-    seen = set()
-    results = []
-    candidate_keys = {"chargecodeidmodels", "chargecodeidmodel", "chargecodes"}
+def chargeCodeChunkSignature(chunk, includeServiceItem=True):
+    normalizedChunk = normalizeChargeCodeChunk(chunk)
+    slots = range(4) if includeServiceItem else (0, 1, 3)
+    return tuple(
+        chargeCodeModelSignature(normalizedChunk[idx]) for idx in slots
+    )
+
+
+def extractChargeCodeChunksFromTimesheetPayload(payload):
+    preferred = []
+    fallback = []
 
     def visit(node):
         if isinstance(node, dict):
             for key, value in node.items():
-                key_lower = str(key).strip().lower()
-                if key_lower in candidate_keys and isinstance(value, list):
-                    for item in value:
-                        normalized = normalizeChargeCodeModel(item)
-                        if normalized is None:
-                            continue
-                        sig = chargeCodeModelSignature(normalized)
-                        if sig is None or sig in seen:
-                            continue
-                        seen.add(sig)
-                        results.append(normalized)
+                keyLower = str(key).strip().lower()
+
+                if keyLower in {"chargecodeidmodels", "chargecodeidmodel"} and isinstance(value, list):
+                    preferred.extend(splitChargeCodeModelsIntoChunks(value))
+                    continue
+
+                if keyLower == "chargecodes" and isinstance(value, list):
+                    fallback.extend(splitChargeCodeModelsIntoChunks(value))
+                    continue
+
                 visit(value)
         elif isinstance(node, list):
             for item in node:
                 visit(item)
 
     visit(payload)
+
+    sourceChunks = preferred or fallback
+    seen = set()
+    results = []
+    for chunk in sourceChunks:
+        sig = chargeCodeChunkSignature(chunk)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        results.append(chunk)
+
+    return results
+
+
+def extractChargeCodeIdModelsFromTimesheetPayload(payload):
+    results = []
+    for chunk in extractChargeCodeChunksFromTimesheetPayload(payload):
+        results.extend(chunk)
     return results
 
 
 def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
     tmpPath = path + ".tmp"
-
-    def chunk4(arr):
-        for i in range(0, len(arr), 4):
-            yield arr[i:i + 4]
-
-    def chunkSignature(chunk):
-        ids = []
-        for x in chunk:
-            if isinstance(x, dict):
-                ids.append(x.get("chargeCodeId"))
-            else:
-                ids.append(None)
-        while len(ids) < 4:
-            ids.append(None)
-        return tuple(ids[:4])
-
-    def isAllNullIds(sig):
-        return all(x is None for x in sig)
-
-    def existingSignatureFromChargeCodeRecord(rec):
-        chunk = rec.get("chargeCodes")
-        if not isinstance(chunk, list):
-            return None
-        return chunkSignature(chunk)
 
     def mkChargeCodeLine(groupKey, chunkIndex, chunk):
         obj = {
@@ -111,121 +248,79 @@ def insertChargeCodesBetweenGroupAndHistory(path, chargeCodeIdModels):
         }
         return json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n"
 
-    normalized = []
-    for m in (chargeCodeIdModels or []):
-        nm = normalizeChargeCodeModel(m)
-        if nm is None:
-            nm = {
-                "chargeCodeId": None,
-                "chargeCodeName": None,
-                "type": None,
-                "hierarchicalName": None,
-                "leave": False,
-            }
-        normalized.append(nm)
+    chunks = []
+    seenNewSignatures = set()
+    for chunk in splitChargeCodeModelsIntoChunks(chargeCodeIdModels or []):
+        sig = chargeCodeChunkSignature(chunk)
+        if sig in seenNewSignatures:
+            continue
+        seenNewSignatures.add(sig)
+        chunks.append(chunk)
 
-    if not normalized:
+    if not chunks:
         return
 
-    if (len(normalized) % 4) != 0:
-        pad = 4 - (len(normalized) % 4)
-        for _ in range(pad):
-            normalized.append({
-                "chargeCodeId": None,
-                "chargeCodeName": None,
-                "type": None,
-                "hierarchicalName": None,
-                "leave": False,
-            })
+    existingGroupsByExactSignature: Dict[Tuple[Any, ...], str] = {}
+    existingGroupsByCoreSignature: Dict[Tuple[Any, ...], str] = {}
 
-    with open(path, "r", encoding="utf-8") as src, open(tmpPath, "w", encoding="utf-8") as dst:
-        inGroup = False
-        groupKey = ""
-        seenChargeCodeSigs = set()
-        insertedSigs = set()
-        maxChunkIndex = -1
-        inserted_any = False
-        saw_group = False
-        saw_history = False
+    with open(path, "r", encoding="utf-8") as src:
+        rawLines = src.readlines()
 
-        def insertMissingChargeCodes():
-            nonlocal insertedSigs, maxChunkIndex, inserted_any
+    for rawLine in rawLines:
+        stripped = rawLine.strip()
+        if not stripped:
+            continue
+        try:
+            rec = json.loads(stripped)
+        except Exception:
+            continue
+        if rec.get("type") != "chargeCode":
+            continue
 
-            nextChunkIndex = maxChunkIndex + 1
-            wrote = 0
-            for chunk in chunk4(normalized):
-                sig = chunkSignature(chunk)
-                if isAllNullIds(sig):
-                    continue
-                if sig in seenChargeCodeSigs or sig in insertedSigs:
-                    continue
+        chunk = normalizeChargeCodeChunk(rec.get("chargeCodes") or [])
+        if not chunkHasChargeCodeValue(chunk):
+            continue
 
-                dst.write(mkChargeCodeLine(groupKey, nextChunkIndex, chunk))
-                insertedSigs.add(sig)
-                nextChunkIndex += 1
-                wrote += 1
-            if wrote:
-                inserted_any = True
-            return wrote
+        groupKey = str(rec.get("groupKey") or "")
+        if not groupKey:
+            continue
 
-        for rawLine in src:
+        existingGroupsByExactSignature.setdefault(chargeCodeChunkSignature(chunk), groupKey)
+        existingGroupsByCoreSignature.setdefault(chargeCodeChunkSignature(chunk, includeServiceItem=False), groupKey)
+
+    newChargeCodeLines: List[str] = []
+    for chunkIndex, chunk in enumerate(chunks):
+        groupKey = existingGroupsByExactSignature.get(chargeCodeChunkSignature(chunk), "")
+        if not groupKey:
+            groupKey = existingGroupsByCoreSignature.get(
+                chargeCodeChunkSignature(chunk, includeServiceItem=False),
+                ""
+            )
+        newChargeCodeLines.append(mkChargeCodeLine(groupKey, chunkIndex, chunk))
+
+    inserted = False
+    with open(tmpPath, "w", encoding="utf-8") as dst:
+        for rawLine in rawLines:
             stripped = rawLine.strip()
-            if not stripped:
-                dst.write(rawLine)
-                continue
-
-            try:
-                rec = json.loads(stripped)
-            except Exception:
-                dst.write(rawLine)
-                continue
-
-            recType = rec.get("type")
-
-            if recType == "group":
-                dst.write(rawLine)
-                saw_group = True
-                inGroup = True
-                insertedSigs = set()
-                seenChargeCodeSigs = set()
-                maxChunkIndex = -1
-                groupKey = rec.get("groupKey") or rec.get("key") or rec.get("name") or ""
-                continue
-
-            if inGroup and recType == "chargeCode":
+            if stripped:
                 try:
-                    ci = rec.get("chunkIndex")
-                    if ci is not None:
-                        maxChunkIndex = max(maxChunkIndex, int(ci))
+                    rec = json.loads(stripped)
                 except Exception:
-                    pass
-
-                sig = existingSignatureFromChargeCodeRecord(rec)
-                if sig is not None:
-                    seenChargeCodeSigs.add(sig)
-
-                dst.write(rawLine)
-                continue
-
-            if inGroup and recType == "history":
-                saw_history = True
-                insertMissingChargeCodes()
-                inGroup = False
-                dst.write(rawLine)
-                continue
-
-            if recType == "history":
-                saw_history = True
+                    rec = None
+                if isinstance(rec, dict):
+                    recType = rec.get("type")
+                    if recType == "chargeCode":
+                        continue
+                    if not inserted and recType == "history":
+                        for line in newChargeCodeLines:
+                            dst.write(line)
+                        inserted = True
 
             dst.write(rawLine)
 
-        # If we never found a group/history section to insert into, append at the end.
-        if not inserted_any and (not saw_group or not saw_history):
-            groupKey = ""
-            maxChunkIndex = -1
-            insertedSigs = set()
-            seenChargeCodeSigs = set()
-            insertMissingChargeCodes()
+        if not inserted:
+            for line in newChargeCodeLines:
+                dst.write(line)
 
     os.replace(tmpPath, path)
 

@@ -1,11 +1,11 @@
 [Setup]
 AppName=Task Tracker
-AppVersion=1.1.3
+AppVersion=1.1.5
 AppPublisher=Nathan Turner
 DefaultDirName={autopf}\Task Tracker
 DefaultGroupName=Task Tracker
 OutputDir=dist-installer
-OutputBaseFilename=TaskTrackerSetup-1.1.3
+OutputBaseFilename=TaskTrackerSetup-1.1.5
 Compression=lzma2
 SolidCompression=yes
 SetupIconFile=hourglass.ico
