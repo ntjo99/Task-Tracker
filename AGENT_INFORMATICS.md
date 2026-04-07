@@ -2,7 +2,7 @@
 
 This document is a navigation map for future agents. It explains where logic lives, what state matters, and which functions are responsible for each decision path.
 
-Last updated: 2026-03-04
+Last updated: 2026-03-30
 
 ## 1) Fast Intent Map
 
@@ -56,6 +56,10 @@ Key mutable fields:
   - Guard for close/save prompts.
 - `activeDayKey: YYYY-MM-DD`
   - Tracked day context used during rollover split processing.
+- `timesheetDateKey: YYYY-MM-DD`
+  - Tracks which date the current posting session / `timesheetId` is bound to.
+- `_timesheetSessionLock`
+  - Serializes punch/session/post work so remote session state is not raced by parallel threads.
 - `_pendingChargePosts: List[{taskSecondsSnapshot, dateKey}]`
   - Queue consumed by `updateLoop` for charge code posting.
 
@@ -97,6 +101,7 @@ Rule:
 Path:
 
 - `startTask(name)`
+  - calls `_ensureCurrentDayContext(now)` first
   - closes prior active segment via `_closeActiveSegment(now)`
   - accumulates elapsed seconds into `tasks`
   - sets `currentTask/currentStart`
@@ -118,8 +123,8 @@ Path:
 
 Current design decision:
 
-- Cross-day check runs on `endDay()` only.
-- It is not continuously polled in `updateLoop`.
+- Cross-day check runs continuously in `updateLoop()`.
+- `endDay()` and `onClose()` also invoke rollover handling before their save/exit logic.
 
 Path:
 
@@ -143,14 +148,11 @@ Rollover punch/post item behavior:
 Path:
 
 - `onClose()`
+  - calls `_rolloverIfNeeded(now)` first
   - optional save prompt
-  - closes active segment and saves only current computed day key
+  - closes active segment and saves the active day key
   - punches out and posts charge codes for that saved day key
-
-Important:
-
-- `onClose()` currently does not call `_rolloverIfNeeded`.
-- If cross-day split must happen on close too, implement there explicitly.
+  - drains queued rollover charge-code posts before destroying the app
 
 ### E) Charge code posting queue
 
@@ -159,6 +161,8 @@ Path:
 - `_queueChargeCodePost(snapshot, dateKey)` appends queue item
 - `updateLoop()` drains `_pendingChargePosts` and calls:
   - `postChargeCodeHours(snapshot, dateKey=item.dateKey)`
+- `postChargeCodeHours(...)` rebinds the posting session to `dateKey` before posting when needed
+- remote punch/session/post work is serialized by `_timesheetSessionLock`
 
 Reason:
 
@@ -178,6 +182,8 @@ Behavior notes:
 - Explicit `punchDt` is used for rollover boundary punches.
 - When `punchDt` is omitted, normal rounding-to-workday behavior may apply.
 - `punchIn/punchOut` return thread handles; callers may `join()` when ordering matters.
+- `initializePunchSession(...)` now also updates `timesheetDateKey`.
+- `startTask`, `deleteTaskPrompt`, and `clearDayData` now use `_ensureCurrentDayContext(...)` so user actions cannot bypass midnight rollover.
 
 
 ## 7) History and Edit Coupling
@@ -194,7 +200,7 @@ Implication:
 ## 8) Where to Change Common Requests
 
 - "Change when rollover triggers"
-  - `timesheet.py` -> call sites of `_rolloverIfNeeded`
+  - `timesheet.py` -> `_ensureCurrentDayContext`, call sites of `_rolloverIfNeeded`
 - "Change split boundary (23:59:59 vs 23:59)"
   - `timesheet.py` -> `_rolloverIfNeeded`
 - "Change punch ordering or retries"
@@ -230,5 +236,5 @@ Use these before claiming rollover/charge-code behavior is correct:
    - rollover `OUT` then `IN` punches executed
    - charge code posts occur for both dates
 3. Close without end day:
-   - verify whether split is expected or intentionally not expected
-
+   - prior day is still split/saved/posted at midnight
+   - current day close choice only affects the current day remainder

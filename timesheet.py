@@ -110,6 +110,7 @@ class TaskTrackerApp:
         self.punchSession = None
         self.employeeId = None
         self.timesheetId = None
+        self.timesheetDateKey = None
 
         self.toastWindow = None
         self.toastTimer = None
@@ -119,6 +120,7 @@ class TaskTrackerApp:
         self._cachedChargeCodesTs = 0.0
         self._pendingChargePosts = []
         self._pendingChargePostLock = threading.Lock()
+        self._timesheetSessionLock = threading.RLock()
         self._punchInSuccess = False
         self._punchOutSuccess = False
 
@@ -719,9 +721,25 @@ class TaskTrackerApp:
 
         self.root.columnconfigure(0, weight=1)
 
+    def _queueUi(self, callback):
+        try:
+            if threading.current_thread() is threading.main_thread():
+                callback()
+            else:
+                self.root.after(0, callback)
+        except Exception:
+            pass
+
     def showToast(self, message, timeout=3000, error=False):
+        if threading.current_thread() is not threading.main_thread():
+            self._queueUi(lambda: self.showToast(message, timeout=timeout, error=error))
+            return
+
         if self.toastTimer is not None:
-            self.root.after_cancel(self.toastTimer)
+            try:
+                self.root.after_cancel(self.toastTimer)
+            except Exception:
+                pass
             self.toastTimer = None
         
         if self.toastWindow is not None:
@@ -731,16 +749,17 @@ class TaskTrackerApp:
                 pass
             self.toastWindow = None
         
-        self.toastWindow = tk.Toplevel(self.root)
-        self.toastWindow.configure(bg=self.bgColor)
-        self.toastWindow.attributes('-alpha', 0.9)
-        self.toastWindow.attributes('-topmost', True)
-        self.toastWindow.overrideredirect(True)
+        toastWindow = tk.Toplevel(self.root)
+        toastWindow.configure(bg=self.bgColor)
+        toastWindow.attributes('-alpha', 0.9)
+        toastWindow.attributes('-topmost', True)
+        toastWindow.overrideredirect(True)
+        self.toastWindow = toastWindow
         
         bgColor = "#8b3333" if error else "#2a2f37"
         
         toastLabel = tk.Label(
-            self.toastWindow,
+            toastWindow,
             text=message,
             font=("Segoe UI", 10),
             fg="#ffffff",
@@ -756,24 +775,26 @@ class TaskTrackerApp:
         ry = self.root.winfo_rooty()
         rw = self.root.winfo_width()
         
-        self.toastWindow.update_idletasks()
-        tw = self.toastWindow.winfo_width()
+        toastWindow.update_idletasks()
+        tw = toastWindow.winfo_width()
         
         x = rx + (rw - tw) // 2
         y = ry + 20
         
-        self.toastWindow.geometry(f"+{x}+{y}")
+        toastWindow.geometry(f"+{x}+{y}")
         
         def dismissToast():
             try:
-                if self.toastWindow is not None:
+                if self.toastWindow is toastWindow:
                     self.toastWindow.destroy()
                     self.toastWindow = None
             except:
                 pass
-            self.toastTimer = None
+            if self.toastTimer == timerId:
+                self.toastTimer = None
         
-        self.toastTimer = self.root.after(timeout, dismissToast)
+        timerId = self.root.after(timeout, dismissToast)
+        self.toastTimer = timerId
 
     def _setBusy(self, active=True):
         if active:
@@ -1382,6 +1403,13 @@ class TaskTrackerApp:
 
         self.activeDayKey = self._currentDateKey(now)
 
+    def _ensureCurrentDayContext(self, now=None):
+        if now is None:
+            now = time.time()
+        self._rolloverIfNeeded(now)
+        self._syncIdleActiveDayKey(now)
+        return now
+
     def _saveTimelineForDate(self, dateKey, sourceTimeline, mergeChoice="append"):
         incomingTimeline = list(sourceTimeline or [])
         existingEntry = self.history.get(dateKey)
@@ -1542,67 +1570,73 @@ class TaskTrackerApp:
             self._recordSegment("Untasked", self.unassignedStart, now)
 
     def initializePunchSession(self, punchDateKey=None):
-        try:
-            posting = self._getPosting(showToast=True)
-            if posting is None:
-                return
-
-            self.punchSession = posting.newSession()
-            posting.primeCookies(self.punchSession)
-            
-            _, loginJson = posting.login(self.punchSession)
-            
-            self.employeeId = posting.extractEmployeeId(loginJson)
-            
-            posting.saveCookies(self.punchSession)
-
-            targetDateKey = str(punchDateKey or date.today().isoformat())
-            timesheetData = posting.copyPreviousTimesheet(self.punchSession, targetDateKey)
-            self.timesheetId = timesheetData["timesheetId"]
-        except Exception as e:
-            self.showToast(f"Login error: {str(e)}", timeout=5000, error=True)
-            self.punchSession = None
-            self.employeeId = None
-            self.timesheetId = None
-
-    def punchIn(self, punchDt=None, silent=False, setBusy=False):
-        if not self.useTimesheetFunctions:
-            return
-
-        def _punchInThread():
+        with self._timesheetSessionLock:
             try:
-                if setBusy:
-                    self.root.after(0, lambda: self._setBusy(True))
-                if not silent:
-                    self.root.after(0, lambda: self.showToast("Clocking in…", timeout=1500))
                 posting = self._getPosting(showToast=True)
                 if posting is None:
                     return
 
-                ts = punchDt if isinstance(punchDt, datetime) else datetime.now()
-                self.initializePunchSession(ts.date().isoformat())
+                self.punchSession = posting.newSession()
+                posting.primeCookies(self.punchSession)
+                
+                _, loginJson = posting.login(self.punchSession)
+                
+                self.employeeId = posting.extractEmployeeId(loginJson)
+                
+                posting.saveCookies(self.punchSession)
 
-                if self.punchSession is None or self.employeeId is None:
-                    return
+                targetDateKey = str(punchDateKey or date.today().isoformat())
+                timesheetData = posting.copyPreviousTimesheet(self.punchSession, targetDateKey)
+                self.timesheetId = timesheetData["timesheetId"]
+                self.timesheetDateKey = targetDateKey
+            except Exception as e:
+                self.showToast(f"Login error: {str(e)}", timeout=5000, error=True)
+                self.punchSession = None
+                self.employeeId = None
+                self.timesheetId = None
+                self.timesheetDateKey = None
 
-                if punchDt is None and self.roundToHours:
-                    try:
-                        h, m = (self.workDayStart).split(":")
-                        workStartDt = ts.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-                        if abs((ts - workStartDt).total_seconds()) <= 5 * 60:
-                            ts = workStartDt
-                    except Exception:
-                        pass
-                punchPayload = {
-                    "id": "",
-                    "punchDate": ts.strftime("%m/%d/%Y %I:%M %p"),
-                    "type": "IN",
-                    "employeeId": self.employeeId,
-                    "timesheetPage": True,
-                    "location": None,
-                    "new": True
-                }
-                posting.postPunch(self.punchSession, punchPayload)
+    def punchIn(self, punchDt=None, silent=False, setBusy=False):
+        if not self.useTimesheetFunctions:
+            return
+        self._punchInSuccess = False
+
+        def _punchInThread():
+            try:
+                self._punchInSuccess = False
+                if setBusy:
+                    self.root.after(0, lambda: self._setBusy(True))
+                if not silent:
+                    self.root.after(0, lambda: self.showToast("Clocking in…", timeout=1500))
+                with self._timesheetSessionLock:
+                    posting = self._getPosting(showToast=True)
+                    if posting is None:
+                        return
+
+                    ts = punchDt if isinstance(punchDt, datetime) else datetime.now()
+                    self.initializePunchSession(ts.date().isoformat())
+
+                    if self.punchSession is None or self.employeeId is None:
+                        return
+
+                    if punchDt is None and self.roundToHours:
+                        try:
+                            h, m = (self.workDayStart).split(":")
+                            workStartDt = ts.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+                            if abs((ts - workStartDt).total_seconds()) <= 5 * 60:
+                                ts = workStartDt
+                        except Exception:
+                            pass
+                    punchPayload = {
+                        "id": "",
+                        "punchDate": ts.strftime("%m/%d/%Y %I:%M %p"),
+                        "type": "IN",
+                        "employeeId": self.employeeId,
+                        "timesheetPage": True,
+                        "location": None,
+                        "new": True
+                    }
+                    posting.postPunch(self.punchSession, punchPayload)
                 self._punchInSuccess = True
                 if not silent:
                     self.showToast("Successfully clocked in!")
@@ -1621,46 +1655,49 @@ class TaskTrackerApp:
     def punchOut(self, punchDt=None, silent=False, setBusy=True):
         if not self.useTimesheetFunctions:
             return
+        self._punchOutSuccess = False
         
         def _punchOutThread():
             try:
+                self._punchOutSuccess = False
                 if setBusy:
                     self.root.after(0, lambda: self._setBusy(True))
                 if not silent:
                     self.root.after(0, lambda: self.showToast("Clocking out…", timeout=1500))
-                posting = self._getPosting(showToast=True)
-                if posting is None:
-                    return
+                with self._timesheetSessionLock:
+                    posting = self._getPosting(showToast=True)
+                    if posting is None:
+                        return
 
-                ts = punchDt if isinstance(punchDt, datetime) else datetime.now()
-                self.initializePunchSession(ts.date().isoformat())
+                    ts = punchDt if isinstance(punchDt, datetime) else datetime.now()
+                    self.initializePunchSession(ts.date().isoformat())
 
-                if self.punchSession is None or self.employeeId is None:
-                    return
-                if punchDt is None and self.roundToHours:
-                    try:
-                        h, m = (self.workDayEnd).split(":")
-                        workEndDt = ts.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-                        if abs((ts - workEndDt).total_seconds()) <= 5 * 60:
-                            ts = workEndDt
-                    except Exception:
-                        pass
-                punchPayload = {
-                    "id": "",
-                    "punchDate": ts.strftime("%m/%d/%Y %I:%M %p"),
-                    "type": "OUT",
-                    "employeeId": self.employeeId,
-                    "revisionNumber": -1,
-                    "chargeCodes": [],
-                    "payType": None,
-                    "noteModel": None,
-                    "billable": False,
-                    "date": None,
-                    "timesheetPage": True,
-                    "location": None,
-                    "new": True
-                }
-                posting.postPunch(self.punchSession, punchPayload)
+                    if self.punchSession is None or self.employeeId is None:
+                        return
+                    if punchDt is None and self.roundToHours:
+                        try:
+                            h, m = (self.workDayEnd).split(":")
+                            workEndDt = ts.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+                            if abs((ts - workEndDt).total_seconds()) <= 5 * 60:
+                                ts = workEndDt
+                        except Exception:
+                            pass
+                    punchPayload = {
+                        "id": "",
+                        "punchDate": ts.strftime("%m/%d/%Y %I:%M %p"),
+                        "type": "OUT",
+                        "employeeId": self.employeeId,
+                        "revisionNumber": -1,
+                        "chargeCodes": [],
+                        "payType": None,
+                        "noteModel": None,
+                        "billable": False,
+                        "date": None,
+                        "timesheetPage": True,
+                        "location": None,
+                        "new": True
+                    }
+                    posting.postPunch(self.punchSession, punchPayload)
                 self._punchOutSuccess = True
                 
             except Exception as e:
@@ -1685,6 +1722,9 @@ class TaskTrackerApp:
             except Exception:
                 pass
 
+            if not bool(getattr(self, "_punchOutSuccess", False)):
+                self.showToast("Clock out failed. Charge codes were not posted.", timeout=5000, error=True)
+                return
             self._queueChargeCodePost(taskSecondsSnapshot, dateKey=dateKey)
 
         threading.Thread(target=_waitAndPost, daemon=True).start()
@@ -1701,7 +1741,19 @@ class TaskTrackerApp:
         except Exception:
             self._pendingChargePosts.append(item)
 
-    def postChargeCodeHours(self, taskSecondsSnapshot=None, dateKey=None):
+    def _popPendingChargePosts(self):
+        pendingPosts = []
+        try:
+            with self._pendingChargePostLock:
+                if self._pendingChargePosts:
+                    pendingPosts = list(self._pendingChargePosts)
+                    self._pendingChargePosts = []
+        except Exception:
+            pendingPosts = list(getattr(self, "_pendingChargePosts", []) or [])
+            self._pendingChargePosts = []
+        return pendingPosts
+
+    def postChargeCodeHours(self, taskSecondsSnapshot=None, dateKey=None, spawnThread=True):
         if not self.autoChargeCodes:
             return
 
@@ -1710,9 +1762,12 @@ class TaskTrackerApp:
             self.showToast("No charge codes found", error=True)
             return
 
+        targetDateKey = date.today().isoformat()
         if dateKey:
             try:
-                dateStr = datetime.strptime(dateKey, "%Y-%m-%d").strftime("%m/%d/%Y")
+                parsedDate = datetime.strptime(dateKey, "%Y-%m-%d")
+                targetDateKey = parsedDate.date().isoformat()
+                dateStr = parsedDate.strftime("%m/%d/%Y")
             except Exception:
                 dateStr = date.today().strftime("%m/%d/%Y")
         else:
@@ -1729,62 +1784,75 @@ class TaskTrackerApp:
                 self.showToast("Charge code posting canceled")
                 return
 
+        def queueUi(callback):
+            self._queueUi(callback)
+
         def job():
             try:
-                self.root.after(0, lambda: self._setBusy(True))
-                self.root.after(0, lambda: self.showToast("Posting charge codes…", timeout=1500))
-                posting = self._getPosting(showToast=True)
-                if posting is None:
-                    return
+                queueUi(lambda: self._setBusy(True))
+                queueUi(lambda: self.showToast("Posting charge codes...", timeout=1500))
+                with self._timesheetSessionLock:
+                    posting = self._getPosting(showToast=True)
+                    if posting is None:
+                        return
 
-                if self.punchSession is None or self.employeeId is None:
-                    self.initializePunchSession()
+                    sessionDateKey = str(getattr(self, "timesheetDateKey", "") or "")
+                    if (
+                        self.punchSession is None
+                        or self.employeeId is None
+                        or self.timesheetId is None
+                        or sessionDateKey != targetDateKey
+                    ):
+                        self.initializePunchSession(targetDateKey)
 
-                if self.punchSession is None or self.employeeId is None:
-                    self.showToast("Session not ready", error=True)
-                    return
+                    if self.punchSession is None or self.employeeId is None or self.timesheetId is None:
+                        queueUi(lambda: self.showToast("Session not ready", error=True))
+                        return
 
-                chargeCodesByKey = dict(plan.get("chargeCodesByKey", {}))
-                hoursByKey = dict(plan.get("hoursByKey", {}))
-                unmappedHours = float(plan.get("unmappedTotal", 0.0))
-                targetTotal = float(plan.get("targetTotal", 0.0))
+                    chargeCodesByKey = dict(plan.get("chargeCodesByKey", {}))
+                    hoursByKey = dict(plan.get("hoursByKey", {}))
+                    unmappedHours = float(plan.get("unmappedTotal", 0.0))
+                    targetTotal = float(plan.get("targetTotal", 0.0))
 
-                hadError = False
-                for key, hours in hoursByKey.items():
-                    if hours <= 0:
-                        continue
-                    hoursPayload = float(f"{hours:.1f}")
-                    try:
-                        posting.postHoursWorked(
-                            self.punchSession,
-                            self.employeeId,
-                            self.timesheetId,
-                            chargeCodesByKey[key],
-                            dateStr,
-                            hoursPayload
-                        )
-                    except Exception:
-                        hadError = True
+                    hadError = False
+                    for key, hours in hoursByKey.items():
+                        if hours <= 0:
+                            continue
+                        hoursPayload = float(f"{hours:.1f}")
+                        try:
+                            posting.postHoursWorked(
+                                self.punchSession,
+                                self.employeeId,
+                                self.timesheetId,
+                                chargeCodesByKey[key],
+                                dateStr,
+                                hoursPayload
+                            )
+                        except Exception:
+                            hadError = True
 
                 mappedTotal = round(sum(hoursByKey.values()), 1)
 
                 if hadError:
-                    self.showToast("Posted charge codes (some failed)", error=True)
+                    queueUi(lambda: self.showToast("Posted charge codes (some failed)", error=True))
                 elif unmappedHours > 0:
-                    self.showToast(
+                    queueUi(lambda: self.showToast(
                         f"Posted {mappedTotal:.1f}h charge codes ({unmappedHours:.1f}h unmapped, day total {targetTotal:.1f}h)",
                         timeout=5000,
                         error=True
-                    )
+                    ))
                 else:
-                    self.showToast("Successfully posted charge codes")
+                    queueUi(lambda: self.showToast("Successfully posted charge codes"))
 
             except Exception:
-                self.showToast("Error posting charge codes", error=True)
+                queueUi(lambda: self.showToast("Error posting charge codes", error=True))
             finally:
-                self.root.after(0, lambda: self._setBusy(False))
+                queueUi(lambda: self._setBusy(False))
 
-        threading.Thread(target=job, daemon=True).start()
+        if spawnThread:
+            threading.Thread(target=job, daemon=True).start()
+        else:
+            job()
 
     def createDragGhost(self, name):
         if name not in self.rows:
@@ -1876,6 +1944,9 @@ class TaskTrackerApp:
         self.relayoutRows()
 
     def onClose(self):
+        now = time.time()
+        self._rolloverIfNeeded(now)
+
         if self.hasUnsavedTime:
             closeChoice = messagebox.askyesnocancel(
                 "Exit Task Tracker",
@@ -1887,6 +1958,7 @@ class TaskTrackerApp:
             if closeChoice is None:
                 return
             if closeChoice is False:
+                self._popPendingChargePosts()
                 self.hasUnsavedTime = False
                 self.dayTimeline = []
                 self.root.destroy()
@@ -1906,12 +1978,21 @@ class TaskTrackerApp:
         self.stopUnassigned(now)
 
         if self.hasUnsavedTime:
-            dayKey = self._currentDateKey(now)
+            dayKey = getattr(self, "activeDayKey", self._currentDateKey(now))
             choice = self._chooseMergeActionForDate(dayKey, allowSkip=True)
             if choice == "cancel":
                 return
 
             if choice == "skip":
+                for item in self._popPendingChargePosts():
+                    if not isinstance(item, dict):
+                        self.postChargeCodeHours(item, spawnThread=False)
+                        continue
+                    self.postChargeCodeHours(
+                        item.get("taskSecondsSnapshot"),
+                        dateKey=item.get("dateKey"),
+                        spawnThread=False
+                    )
                 self.hasUnsavedTime = False
                 self.dayTimeline = []
                 self.root.destroy()
@@ -1926,12 +2007,25 @@ class TaskTrackerApp:
                 punchThread.join()
             if self._punchOutSuccess:
                 self.showToast("Successfully clocked out!")
+                self.postChargeCodeHours(taskSecondsSnapshot, dateKey=dayKey, spawnThread=False)
             else:
-                self.showToast(f"✗ Clock out failed!", error=True)
-            self.postChargeCodeHours(taskSecondsSnapshot, dateKey=dayKey)
+                messagebox.showerror(
+                    "Clock out failed",
+                    "Charge codes were not posted because clock out failed. The summary was still saved locally."
+                )
             
             self.hasUnsavedTime = False
             self.dayTimeline = []
+
+        for item in self._popPendingChargePosts():
+            if not isinstance(item, dict):
+                self.postChargeCodeHours(item, spawnThread=False)
+                continue
+            self.postChargeCodeHours(
+                item.get("taskSecondsSnapshot"),
+                dateKey=item.get("dateKey"),
+                spawnThread=False
+            )
 
         self.root.destroy()
 
@@ -1956,11 +2050,12 @@ class TaskTrackerApp:
         return openHistoryImpl(self)
 
     def clearDayData(self):
+        now = time.time()
+        self._ensureCurrentDayContext(now)
+
         if not messagebox.askyesno("Clear Day", "Clear all times and timeline for today? This cannot be undone."):
             return
-        
-        now = time.time()
-        
+
         if self.currentTask is not None and self.currentStart is not None:
             self.currentTask = None
             self.currentStart = None
@@ -1973,11 +2068,12 @@ class TaskTrackerApp:
         
         self.dayTimeline = []
         
-        dayKey = self._currentDateKey(now)
+        dayKey = getattr(self, "activeDayKey", self._currentDateKey(now))
         if dayKey in self.history:
             del self.history[dayKey]
         
         self.hasUnsavedTime = False
+        self.activeDayKey = self._currentDateKey(now)
         self.refreshRowStyles()
         messagebox.showinfo("Cleared", "All times and timeline have been cleared.")
 
@@ -1987,7 +2083,7 @@ class TaskTrackerApp:
         if self.dragTaskName is not None:
             return
 
-        self._syncIdleActiveDayKey(now)
+        self._ensureCurrentDayContext(now)
 
         self._closeActiveSegment(now)
 
@@ -2058,10 +2154,12 @@ class TaskTrackerApp:
     def deleteTaskPrompt(self, name):
         if name not in self.rows:
             return
-        if not messagebox.askyesno("Delete Task", f"Delete task '{name}'? This does not remove past summaries."):
-            return
 
         now = time.time()
+        self._ensureCurrentDayContext(now)
+
+        if not messagebox.askyesno("Delete Task", f"Delete task '{name}'? This does not remove past summaries."):
+            return
 
         if self.currentTask == name and self.currentStart is not None:
             self._closeActiveSegment(now)
@@ -2092,19 +2190,10 @@ class TaskTrackerApp:
 
     def updateLoop(self):
         now = time.time()
+        self._rolloverIfNeeded(now)
         self._syncIdleActiveDayKey(now)
 
-        pendingPosts = []
-        try:
-            with self._pendingChargePostLock:
-                if self._pendingChargePosts:
-                    pendingPosts = list(self._pendingChargePosts)
-                    self._pendingChargePosts = []
-        except Exception:
-            pendingPosts = list(getattr(self, "_pendingChargePosts", []) or [])
-            self._pendingChargePosts = []
-
-        for item in pendingPosts:
+        for item in self._popPendingChargePosts():
             if not isinstance(item, dict):
                 self.postChargeCodeHours(item)
                 continue
