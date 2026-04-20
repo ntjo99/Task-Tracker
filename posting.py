@@ -336,7 +336,10 @@ def loadEnv(path="posting.env"):
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-_dataDir = os.environ.get("TaskTracker_DATA_DIR", "").strip()
+_dataDir = (
+    os.environ.get("TASK_TRACKER_DATA_DIR", "").strip()
+    or os.environ.get("TaskTracker_DATA_DIR", "").strip()
+)
 if _dataDir:
     _baseDir = _dataDir
     os.makedirs(_baseDir, exist_ok=True)

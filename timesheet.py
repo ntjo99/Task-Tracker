@@ -13,6 +13,16 @@ from openHistory import openHistory as openHistoryImpl
 from settings import openSettings as openSettingsImpl, loadSettings as loadSettingsImpl
 
 
+# Normal installed tracking uses LOCALAPPDATA\Task Tracker.
+# For source testing, flip DEV_MODE to True. That uses DEV_DATA_DIR and disables
+# live timesheet posting so experiments cannot touch your real tracking.
+DEV_MODE = False
+DEV_DATA_DIR = "."
+
+# Optional explicit override. Leave blank unless you want a custom data folder.
+DATA_DIR_OVERRIDE = ""
+
+
 def resourcePath(relPath):
 	candidates = []
 	if getattr(sys, "frozen", False):
@@ -38,7 +48,26 @@ def getBaseDir(self):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
+def resolveDataDirOverride():
+    override = (
+        str(DATA_DIR_OVERRIDE or "").strip()
+        or (str(DEV_DATA_DIR or "").strip() if DEV_MODE else "")
+        or os.environ.get("TASK_TRACKER_DATA_DIR", "").strip()
+        or os.environ.get("TaskTracker_DATA_DIR", "").strip()
+    )
+    if not override:
+        return None
+    dataDir = os.path.expanduser(override)
+    if not os.path.isabs(dataDir):
+        dataDir = os.path.join(getBaseDir(None), dataDir)
+    dataDir = os.path.abspath(dataDir)
+    os.makedirs(dataDir, exist_ok=True)
+    return dataDir
+
 def getDataDir(self):
+    override = resolveDataDirOverride()
+    if override:
+        return override
     appData = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
     dataDir = os.path.join(appData, "Task Tracker")
     os.makedirs(dataDir, exist_ok=True)
@@ -55,10 +84,15 @@ class TaskTrackerApp:
             except Exception:
                 pass
 
-        os.environ["TaskTracker_DATA_DIR"] = self.getDataDir()
+        dataDir = self.getDataDir()
+        os.environ["TASK_TRACKER_DATA_DIR"] = dataDir
+        os.environ["TaskTracker_DATA_DIR"] = dataDir
         self._posting = None
 
-        self.settings = loadSettingsImpl(os.path.join(self.getDataDir(), "settings.json"))
+        self.settings = loadSettingsImpl(os.path.join(dataDir, "settings.json"))
+        if DEV_MODE:
+            self.settings["useTimesheetFunctions"] = False
+            self.settings["autoChargeCodes"] = False
         self.minSegmentSeconds = self.settings["minRecordedMinutes"] * 60
         self.workDayStart = self.settings["workDayStart"]
         self.workDayEnd = self.settings["workDayEnd"]
@@ -127,7 +161,7 @@ class TaskTrackerApp:
 
         self.validateEnvFile()
 
-        baseDir = self.getDataDir()
+        baseDir = dataDir
         self.realPath = os.path.join(baseDir, "tasks.jsonl")
         self.dataFile = self.realPath
         self.dayTimeline = []
@@ -578,6 +612,9 @@ class TaskTrackerApp:
         return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
     def getDataDir(self):
+        override = resolveDataDirOverride()
+        if override:
+            return override
         appData = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
         dataDir = os.path.join(appData, "Task Tracker")
         os.makedirs(dataDir, exist_ok=True)
@@ -591,6 +628,7 @@ class TaskTrackerApp:
             timeline = entry.get("timeline", []) or []
             if timeline:
                 self.dayTimeline = [dict(seg) for seg in timeline]
+                self._rebuildTaskTotalsFromTimeline()
 
     def buildUi(self):
         topBar = tk.Frame(self.root, bg=self.bgColor)
@@ -599,6 +637,8 @@ class TaskTrackerApp:
         topBar.columnconfigure(1, weight=0)
         topBar.columnconfigure(2, weight=0)
         topBar.columnconfigure(3, weight=0)
+        topBar.columnconfigure(4, weight=0)
+        topBar.columnconfigure(5, weight=0)
 
         title = tk.Label(
             topBar,
@@ -625,17 +665,49 @@ class TaskTrackerApp:
 
         clearBtn = tk.Button(
             topBar,
-            text="Clear",
-            font=("Segoe UI", 10, "bold"),
+            text="⌫",
+            font=("Segoe UI", 11, "bold"),
             bg="#1b1f24",
             fg=self.textColor,
             activebackground="#2c3440",
             activeforeground=self.textColor,
             relief="flat",
-            command=self.clearDayData
+            command=self.clearDayData,
+            width=3
         )
         self._styleButton(clearBtn)
         clearBtn.grid(row=0, column=2, sticky="e", padx=(6, 0))
+
+        retroBtn = tk.Button(
+            topBar,
+            text="↙",
+            font=("Segoe UI", 11, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=self.retroClockIn,
+            width=3
+        )
+        self._styleButton(retroBtn)
+        retroBtn.grid(row=0, column=3, sticky="e", padx=(6, 0))
+
+        self.fixRecentBtn = tk.Button(
+            topBar,
+            text="↺",
+            font=("Segoe UI", 11, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=self.reassignRecentTime,
+            width=3
+        )
+        self._styleButton(self.fixRecentBtn)
+        self.fixRecentBtn.grid(row=0, column=4, sticky="e", padx=(6, 0))
+        self.fixRecentBtn.config(state=tk.DISABLED, disabledforeground="#555b66")
 
         historyBtn = tk.Button(
             topBar,
@@ -649,7 +721,7 @@ class TaskTrackerApp:
             command=self.openHistory
         )
         self._styleButton(historyBtn)
-        historyBtn.grid(row=0, column=3, sticky="e", padx=(8, 0))
+        historyBtn.grid(row=0, column=5, sticky="e", padx=(8, 0))
 
         subtitle = tk.Label(
             self.root,
@@ -916,6 +988,473 @@ class TaskTrackerApp:
             if taskName[0].casefold() == targetLetter:
                 self.startTask(name)
                 return "break"
+
+    def _taskNames(self):
+        return list(self.rows.keys())
+
+    def _assignableNames(self):
+        names = self._taskNames()
+        seen = {self._canonicalKey(name) for name in names}
+        try:
+            chargeCodeNames = sorted((self.loadChargeCodesFromJsonl() or {}).keys(), key=lambda x: x.lower())
+        except Exception:
+            chargeCodeNames = []
+        for name in chargeCodeNames:
+            key = self._canonicalKey(name)
+            if key and key not in seen:
+                names.append(name)
+                seen.add(key)
+        return names
+
+    def _ensureTaskRowExists(self, taskName):
+        if not taskName or taskName in self.rows:
+            return
+        self.createTaskRow(taskName)
+        self.relayoutRows()
+        self.saveData()
+
+    def _askTaskAndMinutes(self, title, taskPrompt, initial=None, includeChargeCodes=False, maxMinutes=None):
+        names = self._assignableNames() if includeChargeCodes else self._taskNames()
+        if not names:
+            messagebox.showinfo(title, "Add a task first.")
+            return None
+
+        maxMinutesVal = None
+        if maxMinutes is not None:
+            try:
+                maxMinutesVal = max(0.0, float(maxMinutes))
+            except Exception:
+                maxMinutesVal = None
+
+        result = {"task": None, "minutes": None}
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=self.bgColor)
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        outer = tk.Frame(win, bg=self.bgColor)
+        outer.grid(row=0, column=0, padx=14, pady=12, sticky="nsew")
+        outer.columnconfigure(0, weight=1)
+        outer.columnconfigure(1, weight=0)
+
+        tk.Label(
+            outer,
+            text=taskPrompt,
+            font=("Segoe UI", 10, "bold"),
+            fg=self.textColor,
+            bg=self.bgColor,
+            anchor="w"
+        ).grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+        listFrame = tk.Frame(outer, bg=self.bgColor)
+        listFrame.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+
+        visibleRows = max(4, min(10, len(names)))
+        taskList = tk.Listbox(
+            listFrame,
+            height=visibleRows,
+            width=34,
+            exportselection=False,
+            bg="#2b3138",
+            fg=self.textColor,
+            selectbackground=self.accentColor,
+            selectforeground="#ffffff",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#0b0e12",
+            highlightcolor=self.accentColor,
+            font=("Segoe UI", 10)
+        )
+        taskList.grid(row=0, column=0, sticky="nsew")
+
+        scroll = tk.Scrollbar(listFrame, orient="vertical", command=taskList.yview)
+        taskList.configure(yscrollcommand=scroll.set)
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        for name in names:
+            taskList.insert(tk.END, name)
+
+        initialIndex = 0
+        if initial in names:
+            initialIndex = names.index(initial)
+        taskList.selection_set(initialIndex)
+        taskList.activate(initialIndex)
+        taskList.see(initialIndex)
+
+        timeFrame = tk.Frame(outer, bg=self.bgColor)
+        timeFrame.grid(row=1, column=1, sticky="n")
+
+        tk.Label(
+            timeFrame,
+            text="Minutes",
+            font=("Segoe UI", 10, "bold"),
+            fg="#c9d1d9",
+            bg=self.bgColor,
+            anchor="w"
+        ).grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 6))
+
+        def selectedTask():
+            sel = taskList.curselection()
+            if not sel:
+                return None
+            try:
+                return names[int(sel[0])]
+            except Exception:
+                return None
+
+        def finish(minutes):
+            taskName = selectedTask()
+            if not taskName:
+                messagebox.showerror(title, "Select a task first.", parent=win)
+                return
+            try:
+                minutesVal = float(minutes)
+            except Exception:
+                minutesVal = 0.0
+            if maxMinutesVal is not None:
+                minutesVal = min(minutesVal, maxMinutesVal)
+            if minutesVal <= 0:
+                messagebox.showerror(title, "Enter a positive number of minutes.", parent=win)
+                return
+            result["task"] = taskName
+            result["minutes"] = minutesVal
+            win.destroy()
+
+        for row, minutes in enumerate((15, 30, 60), start=1):
+            btn = tk.Button(
+                timeFrame,
+                text=f"{minutes}",
+                font=("Segoe UI", 11, "bold"),
+                bg=self.accentColor,
+                fg="#ffffff",
+                activebackground="#5b98ff",
+                activeforeground="#ffffff",
+                relief="flat",
+                width=7,
+                command=lambda m=minutes: finish(m)
+            )
+            self._styleButton(btn, hover_bg="#5b98ff")
+            btn.grid(row=row, column=0, columnspan=2, sticky="we", pady=(0, 6))
+
+        if maxMinutesVal is not None:
+            maxText = f"Max {maxMinutesVal:g}"
+            tk.Label(
+                timeFrame,
+                text=maxText,
+                font=("Segoe UI", 8),
+                fg="#9ca3af",
+                bg=self.bgColor,
+                anchor="center"
+            ).grid(row=5, column=0, columnspan=2, sticky="we", pady=(6, 0))
+
+        customEntry = tk.Entry(
+            timeFrame,
+            font=("Segoe UI", 10),
+            bg="#2b3138",
+            fg=self.textColor,
+            insertbackground=self.textColor,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#0b0e12",
+            highlightcolor=self.accentColor,
+            width=8
+        )
+        customEntry.insert(0, "15")
+        customEntry.grid(row=4, column=0, sticky="we", pady=(2, 0))
+
+        customBtn = tk.Button(
+            timeFrame,
+            text="Custom",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=lambda: finish(customEntry.get())
+        )
+        self._styleButton(customBtn)
+        customBtn.grid(row=4, column=1, sticky="we", padx=(6, 0), pady=(2, 0))
+
+        cancelBtn = tk.Button(
+            outer,
+            text="Cancel",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1b1f24",
+            fg=self.textColor,
+            activebackground="#2c3440",
+            activeforeground=self.textColor,
+            relief="flat",
+            command=win.destroy
+        )
+        self._styleButton(cancelBtn)
+        cancelBtn.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        taskList.bind("<Double-Button-1>", lambda _e: finish(customEntry.get()))
+        customEntry.bind("<Return>", lambda _e: finish(customEntry.get()))
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+        win.update_idletasks()
+        try:
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+            ww = win.winfo_width()
+            wh = win.winfo_height()
+            x = rx + max(0, (rw - ww) // 2)
+            y = ry + max(0, (rh - wh) // 2)
+            win.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+        try:
+            win.grab_set()
+            taskList.focus_set()
+            self.root.wait_window(win)
+        finally:
+            try:
+                if win.winfo_exists():
+                    win.grab_release()
+            except Exception:
+                pass
+
+        if result["task"] is None or result["minutes"] is None:
+            return None
+        return result
+
+    def _parseClockTimeForActiveDay(self, raw, nowTs=None):
+        text = str(raw or "").strip()
+        if not text:
+            return None, "Enter a time."
+
+        if nowTs is None:
+            nowTs = time.time()
+
+        dayKey = getattr(self, "activeDayKey", None) or self._currentDateKey(nowTs)
+        try:
+            baseDay = date.fromisoformat(dayKey)
+        except Exception:
+            baseDay = datetime.fromtimestamp(nowTs).date()
+
+        compact = text.replace(" ", "").lower()
+        if compact.isdigit() and len(compact) in (3, 4):
+            text = f"{compact[:-2]}:{compact[-2:]}"
+        elif compact.endswith(("am", "pm")):
+            meridiem = compact[-2:]
+            digits = compact[:-2]
+            if digits.isdigit() and len(digits) in (3, 4):
+                text = f"{digits[:-2]}:{digits[-2:]} {meridiem}"
+
+        formats = ("%I:%M %p", "%I:%M%p", "%I %p", "%I%p", "%H:%M", "%H")
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(text, fmt)
+                candidate = datetime(
+                    baseDay.year,
+                    baseDay.month,
+                    baseDay.day,
+                    parsed.hour,
+                    parsed.minute,
+                    0
+                )
+                return candidate, ""
+            except Exception:
+                continue
+
+        return None, "Use a time like 8:30, 0830, or 8:30 AM."
+
+    def _formatClockTime(self, ts):
+        try:
+            return datetime.fromtimestamp(ts).strftime("%I:%M %p").lstrip("0")
+        except Exception:
+            return ""
+
+    def _segmentTsRange(self, seg):
+        if not isinstance(seg, dict):
+            return None
+        try:
+            startDt = datetime.fromisoformat(seg.get("start", ""))
+            endDt = datetime.fromisoformat(seg.get("end", ""))
+        except Exception:
+            return None
+        startTs = startDt.timestamp()
+        endTs = endDt.timestamp()
+        if endTs <= startTs:
+            return None
+        return startTs, endTs
+
+    def _isoFromTs(self, ts):
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
+
+    def _mergeTimelineSegments(self, timeline):
+        parsed = []
+        for seg in timeline or []:
+            rng = self._segmentTsRange(seg)
+            if rng is None:
+                continue
+            startTs, endTs = rng
+            taskName = str(seg.get("task", "") or "").strip() or "Untasked"
+            parsed.append((startTs, endTs, taskName))
+
+        parsed.sort(key=lambda item: (item[0], item[1], item[2].casefold()))
+        merged = []
+        for startTs, endTs, taskName in parsed:
+            if merged and merged[-1][2] == taskName and startTs <= merged[-1][1]:
+                prevStart, prevEnd, _ = merged[-1]
+                merged[-1] = (prevStart, max(prevEnd, endTs), taskName)
+            else:
+                merged.append((startTs, endTs, taskName))
+
+        return [
+            {"task": taskName, "start": self._isoFromTs(startTs), "end": self._isoFromTs(endTs)}
+            for startTs, endTs, taskName in merged
+        ]
+
+    def _replaceTimelineRangeWithTask(self, startTs, endTs, taskName):
+        if endTs <= startTs or not taskName:
+            return False
+
+        updated = []
+        for seg in self.dayTimeline:
+            rng = self._segmentTsRange(seg)
+            if rng is None:
+                continue
+            segStart, segEnd = rng
+            if segEnd <= startTs or segStart >= endTs:
+                updated.append(dict(seg))
+                continue
+
+            if segStart < startTs:
+                left = dict(seg)
+                left["end"] = self._isoFromTs(startTs)
+                updated.append(left)
+
+            if endTs < segEnd:
+                right = dict(seg)
+                right["start"] = self._isoFromTs(endTs)
+                updated.append(right)
+
+        updated.append({
+            "task": taskName,
+            "start": self._isoFromTs(startTs),
+            "end": self._isoFromTs(endTs)
+        })
+        self.dayTimeline = self._mergeTimelineSegments(updated)
+        return True
+
+    def _rebuildTaskTotalsFromTimeline(self):
+        totals = self._collectTaskSecondsFromTimeline(self.dayTimeline)
+        self.tasks = {name: float(totals.get(name, 0.0) or 0.0) for name in self.rows.keys()}
+
+    def retroClockIn(self):
+        now = time.time()
+        self._ensureCurrentDayContext(now)
+
+        defaultTask = self.currentTask or (self._taskNames()[0] if self._taskNames() else None)
+        choice = self._askTaskAndMinutes(
+            "Retro Clock In",
+            "Select the task and how far back it should start.",
+            initial=defaultTask
+        )
+        if not choice:
+            return
+
+        taskName = choice["task"]
+        minutes = float(choice["minutes"])
+        startTs = now - (minutes * 60.0)
+        startDt = datetime.fromtimestamp(startTs)
+
+        if startTs >= now:
+            messagebox.showerror("Retro Clock In", "The clock-in time must be before now.")
+            return
+
+        dayKey = getattr(self, "activeDayKey", self._currentDateKey(now))
+        if self._currentDateKey(startTs) != dayKey:
+            messagebox.showerror("Retro Clock In", "Use a time from the active day.")
+            return
+
+        hadAnyTrackedTime = bool(self.dayTimeline) or any(float(v or 0.0) > 0.0 for v in self.tasks.values())
+        hadAnyTrackedTime = hadAnyTrackedTime or self.unassignedSeconds > 0 or self.unassignedStart is not None
+        hadAnyTrackedTime = hadAnyTrackedTime or self.currentTask is not None or self.currentStart is not None
+
+        self._closeActiveSegment(now)
+        if self.currentTask is not None and self.currentStart is not None:
+            elapsed = max(0.0, now - self.currentStart)
+            self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
+        self.stopUnassigned(now)
+
+        if not self._replaceTimelineRangeWithTask(startTs, now, taskName):
+            messagebox.showerror("Retro Clock In", "Could not update the retroactive time window.")
+            return
+        self._rebuildTaskTotalsFromTimeline()
+
+        self.hasEverSelectedTask = True
+        self.currentTask = taskName
+        self.currentStart = now
+        self.unassignedStart = None
+        self.hasUnsavedTime = True
+        self.refreshRowStyles()
+
+        if not hadAnyTrackedTime:
+            self.punchIn(punchDt=startDt)
+
+        self.showToast(f"{taskName} started {minutes:g} minutes ago")
+
+    def reassignRecentTime(self):
+        now = time.time()
+        self._ensureCurrentDayContext(now)
+
+        if self.currentTask is None or self.currentStart is None:
+            self.refreshRowStyles()
+            messagebox.showinfo("Fix Recent Time", "Select an active task before fixing recent time.")
+            return
+
+        availableSeconds = max(0.0, now - float(self.currentStart))
+        if availableSeconds <= 0.0:
+            messagebox.showinfo("Fix Recent Time", "There is no active selected time to reassign yet.")
+            return
+
+        defaultTask = self.currentTask
+        choice = self._askTaskAndMinutes(
+            "Fix Recent Time",
+            "Select the task or charge code and how much recent time to move.",
+            initial=defaultTask,
+            includeChargeCodes=True,
+            maxMinutes=availableSeconds / 60.0
+        )
+        if not choice:
+            return
+
+        taskName = choice["task"]
+        minutes = min(float(choice["minutes"]), availableSeconds / 60.0)
+        self._ensureTaskRowExists(taskName)
+
+        startTs = now - (minutes * 60.0)
+        dayKey = getattr(self, "activeDayKey", self._currentDateKey(now))
+        if self._currentDateKey(startTs) != dayKey:
+            messagebox.showerror("Fix Recent Time", "The recent window cannot cross into another day.")
+            return
+
+        self._closeActiveSegment(now)
+        if self.currentTask is not None and self.currentStart is not None:
+            elapsed = max(0.0, now - self.currentStart)
+            self.tasks[self.currentTask] = self.tasks.get(self.currentTask, 0.0) + elapsed
+        self.stopUnassigned(now)
+
+        if not self._replaceTimelineRangeWithTask(startTs, now, taskName):
+            messagebox.showerror("Fix Recent Time", "Could not update the recent time window.")
+            return
+
+        self._rebuildTaskTotalsFromTimeline()
+        self.hasEverSelectedTask = True
+        self.currentTask = taskName
+        self.currentStart = now
+        self.unassignedStart = None
+        self.hasUnsavedTime = True
+        self.refreshRowStyles()
+        self.showToast(f"Moved last {minutes:g} minutes to {taskName}")
 
     def loadData(self):
         if not os.path.exists(self.dataFile):
@@ -1522,6 +2061,46 @@ class TaskTrackerApp:
 
         return appended
 
+    def _overlayTimelineSegments(self, baseTimeline, overlayTimeline):
+        timeline = []
+        for seg in baseTimeline or []:
+            if self._segmentTsRange(seg) is not None:
+                timeline.append(dict(seg))
+
+        overlay = []
+        for seg in overlayTimeline or []:
+            rng = self._segmentTsRange(seg)
+            if rng is None:
+                continue
+            overlay.append((rng[0], rng[1], dict(seg)))
+        overlay.sort(key=lambda item: (item[0], item[1]))
+
+        for overlayStart, overlayEnd, overlaySeg in overlay:
+            nextTimeline = []
+            for seg in timeline:
+                rng = self._segmentTsRange(seg)
+                if rng is None:
+                    continue
+                segStart, segEnd = rng
+                if segEnd <= overlayStart or segStart >= overlayEnd:
+                    nextTimeline.append(dict(seg))
+                    continue
+
+                if segStart < overlayStart:
+                    left = dict(seg)
+                    left["end"] = self._isoFromTs(overlayStart)
+                    nextTimeline.append(left)
+
+                if overlayEnd < segEnd:
+                    right = dict(seg)
+                    right["start"] = self._isoFromTs(overlayEnd)
+                    nextTimeline.append(right)
+
+            nextTimeline.append(dict(overlaySeg))
+            timeline = self._mergeTimelineSegments(nextTimeline)
+
+        return timeline
+
     def _buildTimelineSavePlan(self, dateKey, sourceTimeline, mergeChoice="append"):
         incomingTimeline = [dict(seg) if isinstance(seg, dict) else seg for seg in list(sourceTimeline or [])]
         existingEntry = self.history.get(dateKey)
@@ -1533,8 +2112,7 @@ class TaskTrackerApp:
             ]
 
         if mergeChoice == "append":
-            appendTimeline = self._subtractExistingTimelineSegments(incomingTimeline, existingTimeline)
-            timeline = list(existingTimeline) + appendTimeline
+            timeline = self._overlayTimelineSegments(existingTimeline, incomingTimeline)
         else:
             timeline = list(incomingTimeline)
 
@@ -1542,19 +2120,11 @@ class TaskTrackerApp:
         taskSecondsSnapshot = self._collectTaskSecondsFromTimeline(timeline)
         summary = self._buildSummaryFromTaskSeconds(taskSecondsSnapshot)
 
-        postTaskSecondsSnapshot = dict(taskSecondsSnapshot)
-        if mergeChoice == "append" and existingTimeline:
-            existingTaskSecondsSnapshot = self._collectTaskSecondsFromTimeline(existingTimeline)
-            postTaskSecondsSnapshot = self._subtractTaskSeconds(
-                taskSecondsSnapshot,
-                existingTaskSecondsSnapshot
-            )
-
         return {
             "timeline": timeline,
             "summary": summary,
             "taskSecondsSnapshot": taskSecondsSnapshot,
-            "postTaskSecondsSnapshot": postTaskSecondsSnapshot,
+            "postTaskSecondsSnapshot": dict(taskSecondsSnapshot),
         }
 
     def _saveTimelineForDate(self, dateKey, sourceTimeline, mergeChoice="append"):
@@ -1735,7 +2305,7 @@ class TaskTrackerApp:
                 self.timesheetDateKey = None
 
     def punchIn(self, punchDt=None, silent=False, setBusy=False):
-        if not self.useTimesheetFunctions:
+        if DEV_MODE or not self.useTimesheetFunctions:
             return
         self._punchInSuccess = False
 
@@ -1791,7 +2361,7 @@ class TaskTrackerApp:
         return thread
 
     def punchOut(self, punchDt=None, silent=False, setBusy=True):
-        if not self.useTimesheetFunctions:
+        if DEV_MODE or not self.useTimesheetFunctions:
             return
         self._punchOutSuccess = False
         
@@ -1892,7 +2462,7 @@ class TaskTrackerApp:
         return pendingPosts
 
     def postChargeCodeHours(self, taskSecondsSnapshot=None, dateKey=None, spawnThread=True):
-        if not self.autoChargeCodes:
+        if DEV_MODE or not self.autoChargeCodes:
             return
 
         targetDateKey = date.today().isoformat()
@@ -1952,11 +2522,10 @@ class TaskTrackerApp:
                     unmappedHours = float(plan.get("unmappedTotal", 0.0))
                     targetTotal = float(plan.get("targetTotal", 0.0))
 
+                    postedCount = 0
                     hadError = False
                     for key, hours in hoursByKey.items():
-                        if hours <= 0:
-                            continue
-                        hoursPayload = float(f"{hours:.1f}")
+                        hoursPayload = max(0.0, float(f"{hours:.1f}"))
                         try:
                             posting.postHoursWorked(
                                 self.punchSession,
@@ -1966,21 +2535,22 @@ class TaskTrackerApp:
                                 dateStr,
                                 hoursPayload
                             )
+                            postedCount += 1
                         except Exception:
                             hadError = True
 
                 mappedTotal = round(sum(hoursByKey.values()), 1)
 
                 if hadError:
-                    queueUi(lambda: self.showToast("Posted charge codes (some failed)", error=True))
+                    queueUi(lambda: self.showToast("Synced charge codes (some failed)", error=True))
                 elif unmappedHours > 0:
                     queueUi(lambda: self.showToast(
-                        f"Posted {mappedTotal:.1f}h charge codes ({unmappedHours:.1f}h unmapped, day total {targetTotal:.1f}h)",
+                        f"Synced {postedCount} charge codes ({mappedTotal:.1f}h mapped, {unmappedHours:.1f}h unmapped, day total {targetTotal:.1f}h)",
                         timeout=5000,
                         error=True
                     ))
                 else:
-                    queueUi(lambda: self.showToast("Successfully posted charge codes"))
+                    queueUi(lambda: self.showToast(f"Synced {postedCount} charge codes"))
 
             except Exception:
                 queueUi(lambda: self.showToast("Error posting charge codes", error=True))
@@ -2293,6 +2863,12 @@ class TaskTrackerApp:
             nameLabel.config(bg=bg)
             deleteBtn.config(bg=bg)
 
+        try:
+            canFixRecent = self.currentTask is not None and self.currentStart is not None
+            self.fixRecentBtn.config(state=tk.NORMAL if canFixRecent else tk.DISABLED)
+        except Exception:
+            pass
+
     def deleteTaskPrompt(self, name):
         if name not in self.rows:
             return
@@ -2552,13 +3128,18 @@ class TaskTrackerApp:
             f"Mapped: {mappedTotal:.1f} h",
             f"Unmapped: {unmappedTotal:.1f} h",
             "",
-            "Charge code posting:",
+            "Charge code sync:",
         ]
 
+        zeroCount = 0
         for key, hours in sorted(hoursByKey.items(), key=lambda kv: kv[0].lower()):
             if hours <= 0:
+                zeroCount += 1
                 continue
             lines.append(f"  {key}: {hours:.1f} h")
+
+        if zeroCount:
+            lines.append(f"  {zeroCount} loaded charge codes will be set to 0.0 h")
 
         if unmappedByTask:
             lines.append("")
@@ -2567,7 +3148,7 @@ class TaskTrackerApp:
                 lines.append(f"  {task}: {hours:.1f} h")
 
         lines.append("")
-        lines.append("Post charge codes now?")
+        lines.append("Sync charge codes now?")
         return messagebox.askyesno("Review Charge Codes", "\n".join(lines))
 
     def _updateSessionStatusStrip(self):
@@ -2793,6 +3374,8 @@ class TaskTrackerApp:
         return chargeCodesByKey
 
     def validateEnvFile(self):
+        if DEV_MODE:
+            return
         if not self.useTimesheetFunctions and not self.autoChargeCodes:
             return
         envPath = os.path.join(self.getDataDir(), "posting.env")
