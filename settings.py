@@ -84,6 +84,27 @@ def loadChargeCodesFromJsonl(dataFile):
         pass
     return chunks
 
+def chargeCodeChunkIdentity(chunk):
+    try:
+        import posting
+        return posting.chargeCodeChunkSignature(chunk)
+    except Exception:
+        pass
+
+    identity = []
+    for code in list(chunk or []):
+        if not isinstance(code, dict):
+            identity.append(None)
+            continue
+        identity.append((
+            code.get("chargeCodeId") or code.get("chargeCodeID") or code.get("CHARGECODEID"),
+            code.get("chargeCodeName"),
+            code.get("type"),
+            code.get("hierarchicalName"),
+            bool(code.get("leave")),
+        ))
+    return tuple(identity)
+
 
 def loadPostingEnv(baseDir):
     envPath = os.path.join(baseDir, "posting.env")
@@ -1203,6 +1224,26 @@ def openSettings(app):
             return ""
         return ""
 
+    def readGroupKeyForChunkIdentity(chunkCodes):
+        targetIdentity = chargeCodeChunkIdentity(chunkCodes)
+        try:
+            with open(dataFile, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if obj.get("type") != "chargeCode":
+                        continue
+                    if chargeCodeChunkIdentity(obj.get("chargeCodes", [])) == targetIdentity:
+                        return (obj.get("groupKey") or "").strip()
+        except Exception:
+            return ""
+        return ""
+
     def rebuildChargeCodeTable():
         nonlocal chargeCodeChunks, chargeCodeVars
         taskGroupOptions = getTaskGroupOptions()
@@ -1211,6 +1252,14 @@ def openSettings(app):
             idx: (var.get() or "").strip()
             for idx, var in chargeCodeVars.items()
         }
+        previousSelectionsByIdentity = {}
+        previousIdentitiesByIndex = {}
+        for idx, chunkCodes in enumerate(chargeCodeChunks):
+            identity = chargeCodeChunkIdentity(chunkCodes)
+            previousIdentitiesByIndex[idx] = identity
+            selection = previousSelections.get(idx)
+            if selection is not None:
+                previousSelectionsByIdentity[identity] = selection
 
         for child in tableFrame.winfo_children():
             child.destroy()
@@ -1255,7 +1304,12 @@ def openSettings(app):
             )
             codesLabel.grid(row=0, column=0, sticky="w", padx=12, pady=6)
 
-            currentGroup = previousSelections.get(chunkIdx)
+            chunkIdentity = chargeCodeChunkIdentity(chunkCodes)
+            currentGroup = previousSelectionsByIdentity.get(chunkIdentity)
+            if currentGroup is None:
+                currentGroup = readGroupKeyForChunkIdentity(chunkCodes)
+            if currentGroup is None and previousIdentitiesByIndex.get(chunkIdx) == chunkIdentity:
+                currentGroup = previousSelections.get(chunkIdx)
             if currentGroup is None:
                 currentGroup = readGroupKeyForChunk(chunkIdx)
 

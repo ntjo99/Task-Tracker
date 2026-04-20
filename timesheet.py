@@ -118,6 +118,7 @@ class TaskTrackerApp:
         self._nextStatusRefreshTs = 0.0
         self._cachedChargeCodesByKey = {}
         self._cachedChargeCodesTs = 0.0
+        self._sessionChargeCodesByDateKey = {}
         self._pendingChargePosts = []
         self._pendingChargePostLock = threading.Lock()
         self._timesheetSessionLock = threading.RLock()
@@ -139,7 +140,7 @@ class TaskTrackerApp:
         self.updateLoop()
 
         self.root.bind("<Delete>", self.deleteSelected)
-        self.root.bind("<KeyPress>", self.startGeneralTask)
+        self.root.bind_all("<KeyPress>", self.startGeneralTask, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.onClose)
 
     def _clamp01(self, x):
@@ -683,6 +684,7 @@ class TaskTrackerApp:
         )
         self.newTaskEntry.grid(row=3, column=0, padx=(12, 6), pady=6, sticky="we")
         self.newTaskEntry.bind("<Return>", self.onEntryReturn)
+        self.newTaskEntry.bind("<KeyPress>", self.startGeneralTask, add="+")
         self._applyPlaceholder(self.newTaskEntry, "Add a task…")
 
         self.addTaskButton = tk.Button(
@@ -868,13 +870,24 @@ class TaskTrackerApp:
         self.addTask()
         return "break"
 
+    def _entryHasPlaceholder(self, entry):
+        try:
+            return str(entry.cget("fg")) == "#6b7280"
+        except Exception:
+            return False
+
     def startGeneralTask(self, event=None):
         # Global letter hotkey: start the highest-ordered task whose name starts with that letter.
         try:
             if self.root.focus_displayof() is None:
                 return
             focused = self.root.focus_get()
-            if isinstance(focused, tk.Entry):
+            if focused is not None and focused.winfo_toplevel() is not self.root:
+                return
+            if isinstance(focused, tk.Entry) and not (
+                focused is getattr(self, "newTaskEntry", None)
+                and self._entryHasPlaceholder(focused)
+            ):
                 return
         except Exception:
             return
@@ -1410,29 +1423,149 @@ class TaskTrackerApp:
         self._syncIdleActiveDayKey(now)
         return now
 
-    def _saveTimelineForDate(self, dateKey, sourceTimeline, mergeChoice="append"):
-        incomingTimeline = list(sourceTimeline or [])
+    def _timelineSegmentSignature(self, seg):
+        if not isinstance(seg, dict):
+            return None
+        return (
+            str(seg.get("task", "") or ""),
+            str(seg.get("start", "") or ""),
+            str(seg.get("end", "") or ""),
+        )
+
+    def _timelineStartsWith(self, timeline, prefix):
+        if not isinstance(timeline, list) or not isinstance(prefix, list):
+            return False
+        if len(prefix) > len(timeline):
+            return False
+        for idx, prefixSeg in enumerate(prefix):
+            if self._timelineSegmentSignature(timeline[idx]) != self._timelineSegmentSignature(prefixSeg):
+                return False
+        return True
+
+    def _subtractTaskSeconds(self, currentSeconds, priorSeconds):
+        delta = {}
+        allKeys = set((currentSeconds or {}).keys()) | set((priorSeconds or {}).keys())
+        for key in allKeys:
+            try:
+                currentVal = float((currentSeconds or {}).get(key, 0.0) or 0.0)
+            except Exception:
+                currentVal = 0.0
+            try:
+                priorVal = float((priorSeconds or {}).get(key, 0.0) or 0.0)
+            except Exception:
+                priorVal = 0.0
+            remaining = currentVal - priorVal
+            if remaining > 0.0:
+                delta[key] = remaining
+        return delta
+
+    def _subtractExistingTimelineSegments(self, incomingTimeline, existingTimeline):
+        if not existingTimeline:
+            return list(incomingTimeline or [])
+
+        def parseSeg(seg):
+            if not isinstance(seg, dict):
+                return None
+            try:
+                startDt = datetime.fromisoformat(seg.get("start", ""))
+                endDt = datetime.fromisoformat(seg.get("end", ""))
+            except Exception:
+                return None
+            if endDt <= startDt:
+                return None
+            return str(seg.get("task", "") or ""), startDt, endDt
+
+        existingByTask = {}
+        for seg in existingTimeline:
+            parsed = parseSeg(seg)
+            if parsed is None:
+                continue
+            taskName, startDt, endDt = parsed
+            existingByTask.setdefault(taskName, []).append((startDt, endDt))
+
+        for ranges in existingByTask.values():
+            ranges.sort(key=lambda item: item[0])
+
+        appended = []
+        for seg in incomingTimeline or []:
+            parsed = parseSeg(seg)
+            if parsed is None:
+                appended.append(seg)
+                continue
+
+            taskName, startDt, endDt = parsed
+            remaining = [(startDt, endDt)]
+            for existStart, existEnd in existingByTask.get(taskName, []):
+                nextRemaining = []
+                for pieceStart, pieceEnd in remaining:
+                    if existEnd <= pieceStart or existStart >= pieceEnd:
+                        nextRemaining.append((pieceStart, pieceEnd))
+                        continue
+                    if pieceStart < existStart:
+                        nextRemaining.append((pieceStart, min(pieceEnd, existStart)))
+                    if existEnd < pieceEnd:
+                        nextRemaining.append((max(pieceStart, existEnd), pieceEnd))
+                remaining = nextRemaining
+                if not remaining:
+                    break
+
+            minDuration = float(getattr(self, "minSegmentSeconds", 0.0) or 0.0)
+            for pieceStart, pieceEnd in remaining:
+                if pieceEnd <= pieceStart:
+                    continue
+                if minDuration > 0.0 and (pieceEnd - pieceStart).total_seconds() < minDuration:
+                    continue
+                piece = dict(seg)
+                piece["start"] = pieceStart.strftime("%Y-%m-%dT%H:%M:%S")
+                piece["end"] = pieceEnd.strftime("%Y-%m-%dT%H:%M:%S")
+                appended.append(piece)
+
+        return appended
+
+    def _buildTimelineSavePlan(self, dateKey, sourceTimeline, mergeChoice="append"):
+        incomingTimeline = [dict(seg) if isinstance(seg, dict) else seg for seg in list(sourceTimeline or [])]
         existingEntry = self.history.get(dateKey)
         existingTimeline = []
         if isinstance(existingEntry, dict):
-            existingTimeline = existingEntry.get("timeline", []) or []
+            existingTimeline = [
+                dict(seg) if isinstance(seg, dict) else seg
+                for seg in (existingEntry.get("timeline", []) or [])
+            ]
 
         if mergeChoice == "append":
-            timeline = list(existingTimeline) + incomingTimeline
+            appendTimeline = self._subtractExistingTimelineSegments(incomingTimeline, existingTimeline)
+            timeline = list(existingTimeline) + appendTimeline
         else:
-            timeline = incomingTimeline
+            timeline = list(incomingTimeline)
 
         timeline = self._roundTimelineEdgesToHour(timeline)
         taskSecondsSnapshot = self._collectTaskSecondsFromTimeline(timeline)
         summary = self._buildSummaryFromTaskSeconds(taskSecondsSnapshot)
 
-        entry = {
+        postTaskSecondsSnapshot = dict(taskSecondsSnapshot)
+        if mergeChoice == "append" and existingTimeline:
+            existingTaskSecondsSnapshot = self._collectTaskSecondsFromTimeline(existingTimeline)
+            postTaskSecondsSnapshot = self._subtractTaskSeconds(
+                taskSecondsSnapshot,
+                existingTaskSecondsSnapshot
+            )
+
+        return {
+            "timeline": timeline,
             "summary": summary,
-            "timeline": timeline
+            "taskSecondsSnapshot": taskSecondsSnapshot,
+            "postTaskSecondsSnapshot": postTaskSecondsSnapshot,
+        }
+
+    def _saveTimelineForDate(self, dateKey, sourceTimeline, mergeChoice="append"):
+        savePlan = self._buildTimelineSavePlan(dateKey, sourceTimeline, mergeChoice=mergeChoice)
+        entry = {
+            "summary": savePlan.get("summary", "") or "",
+            "timeline": savePlan.get("timeline", []) or []
         }
         self.history[dateKey] = entry
         self.append_history_entry(dateKey, entry)
-        return taskSecondsSnapshot
+        return savePlan
 
     def _resetDaySessionState(self):
         self.dayTimeline = []
@@ -1541,11 +1674,11 @@ class TaskTrackerApp:
                     self.unassignedStart = midnightTs
 
                 dayKey = activeDay.isoformat()
-                taskSecondsSnapshot = self._saveTimelineForDate(dayKey, self.dayTimeline, mergeChoice="append")
+                savePlan = self._saveTimelineForDate(dayKey, self.dayTimeline, mergeChoice="append")
                 splitDates.append(dayKey)
                 rolloverItems.append({
                     "dayKey": dayKey,
-                    "taskSecondsSnapshot": taskSecondsSnapshot,
+                    "taskSecondsSnapshot": savePlan.get("postTaskSecondsSnapshot", {}),
                     "outDt": endOfActiveDayDt,
                     "inDt": midnightDt,
                 })
@@ -1589,6 +1722,11 @@ class TaskTrackerApp:
                 timesheetData = posting.copyPreviousTimesheet(self.punchSession, targetDateKey)
                 self.timesheetId = timesheetData["timesheetId"]
                 self.timesheetDateKey = targetDateKey
+                self._refreshChargeCodesForDateKey(
+                    targetDateKey,
+                    timesheetData.get("chargeCodeIDModels") or [],
+                    postingModule=posting
+                )
             except Exception as e:
                 self.showToast(f"Login error: {str(e)}", timeout=5000, error=True)
                 self.punchSession = None
@@ -1757,11 +1895,6 @@ class TaskTrackerApp:
         if not self.autoChargeCodes:
             return
 
-        chargeCodesByKey = self.loadChargeCodesFromJsonl()
-        if not chargeCodesByKey:
-            self.showToast("No charge codes found", error=True)
-            return
-
         targetDateKey = date.today().isoformat()
         if dateKey:
             try:
@@ -1772,6 +1905,11 @@ class TaskTrackerApp:
                 dateStr = date.today().strftime("%m/%d/%Y")
         else:
             dateStr = date.today().strftime("%m/%d/%Y")
+
+        chargeCodesByKey = self._getChargeCodesForDateKey(targetDateKey)
+        if not chargeCodesByKey:
+            self.showToast("No charge codes found", error=True)
+            return
 
         plan = self._buildChargeCodePostingPlan(taskSecondsSnapshot, chargeCodesByKey)
         roundedTaskHours = dict(plan.get("roundedTaskHours", {}))
@@ -1999,7 +2137,7 @@ class TaskTrackerApp:
                 return
 
             mergeChoice = "append" if choice == "append" else "overwrite"
-            taskSecondsSnapshot = self._saveTimelineForDate(dayKey, self.dayTimeline, mergeChoice=mergeChoice)
+            savePlan = self._saveTimelineForDate(dayKey, self.dayTimeline, mergeChoice=mergeChoice)
             
             # Punch out when closing with unsaved time
             punchThread = self.punchOut()
@@ -2007,7 +2145,11 @@ class TaskTrackerApp:
                 punchThread.join()
             if self._punchOutSuccess:
                 self.showToast("Successfully clocked out!")
-                self.postChargeCodeHours(taskSecondsSnapshot, dateKey=dayKey, spawnThread=False)
+                self.postChargeCodeHours(
+                    savePlan.get("postTaskSecondsSnapshot", {}),
+                    dateKey=dayKey,
+                    spawnThread=False
+                )
             else:
                 messagebox.showerror(
                     "Clock out failed",
@@ -2369,6 +2511,34 @@ class TaskTrackerApp:
             self._cachedChargeCodesTs = now
         return dict(self._cachedChargeCodesByKey or {})
 
+    def _refreshChargeCodesForDateKey(self, targetDateKey, chargeCodeIdModels=None, postingModule=None):
+        dateKey = str(targetDateKey or "").strip()
+        if not dateKey:
+            return {}
+
+        if chargeCodeIdModels:
+            try:
+                if not os.path.exists(self.realPath):
+                    self.sync_task_group_section()
+                posting = postingModule if postingModule is not None else self._getPosting(showToast=False)
+                if posting is not None:
+                    posting.insertChargeCodesBetweenGroupAndHistory(self.realPath, chargeCodeIdModels)
+                    self._cachedChargeCodesTs = 0.0
+            except Exception:
+                pass
+
+        chargeCodesByKey = self.loadChargeCodesFromJsonl() or {}
+        self._sessionChargeCodesByDateKey[dateKey] = dict(chargeCodesByKey)
+        return dict(chargeCodesByKey)
+
+    def _getChargeCodesForDateKey(self, targetDateKey=None):
+        dateKey = str(targetDateKey or "").strip()
+        if dateKey:
+            cached = getattr(self, "_sessionChargeCodesByDateKey", {}).get(dateKey)
+            if isinstance(cached, dict) and cached:
+                return dict(cached)
+        return self.loadChargeCodesFromJsonl() or {}
+
     def _confirmChargeCodeReview(self, plan, dateStr):
         hoursByKey = dict(plan.get("hoursByKey", {}))
         unmappedByTask = dict(plan.get("unmappedByTask", {}))
@@ -2580,10 +2750,13 @@ class TaskTrackerApp:
             return
 
         mergeChoice = "append" if choice == "append" else "overwrite"
-        taskSecondsSnapshot = self._saveTimelineForDate(dayKey, self.dayTimeline, mergeChoice=mergeChoice)
+        savePlan = self._saveTimelineForDate(dayKey, self.dayTimeline, mergeChoice=mergeChoice)
         merged = self.history.get(dayKey, {}).get("summary", "")
 
-        self._postAfterPunchOut(taskSecondsSnapshot, dateKey=dayKey)
+        self._postAfterPunchOut(
+            savePlan.get("postTaskSecondsSnapshot", {}),
+            dateKey=dayKey
+        )
         
         # CLEAR session data after saving TODO: should this be a setting?
         self._resetDaySessionState()

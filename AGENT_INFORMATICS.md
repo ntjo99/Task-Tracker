@@ -115,8 +115,8 @@ Path:
   - calls `_rolloverIfNeeded(now)` first
   - closes active segment
   - merge policy prompt (`append/overwrite/cancel`)
-  - `_saveTimelineForDate(dayKey, dayTimeline, mergeChoice)`
-  - `_postAfterPunchOut(taskSecondsSnapshot, dateKey=dayKey)`
+  - `_saveTimelineForDate(dayKey, dayTimeline, mergeChoice)` builds a merged save plan
+  - `_postAfterPunchOut(postTaskSecondsSnapshot, dateKey=dayKey)` posts only the newly added portion on append saves
   - clears in-memory day session state
 
 ### C) Cross-day split logic
@@ -133,6 +133,7 @@ Path:
     - close segment at `23:59:59` of prior day
     - continue active timer at `00:00:00` next day
     - save prior day via `_saveTimelineForDate`
+    - if the in-memory timeline already starts with the saved history for that date, avoid appending that prefix again
     - collect rollover punch/post work items
   - show rollover toast
   - `_processRolloverPunchesAndPosts(items)`
@@ -141,7 +142,7 @@ Rollover punch/post item behavior:
 
 - punch `OUT` for prior day
 - punch `IN` for next day
-- queue charge code post for prior day snapshot/dateKey
+- queue charge code post only for the incremental snapshot/dateKey
 
 ### D) Close app flow
 
@@ -162,6 +163,7 @@ Path:
 - `updateLoop()` drains `_pendingChargePosts` and calls:
   - `postChargeCodeHours(snapshot, dateKey=item.dateKey)`
 - `postChargeCodeHours(...)` rebinds the posting session to `dateKey` before posting when needed
+- `postChargeCodeHours(...)` should use the charge-code cache for that exact `dateKey`, not only the latest JSONL refresh
 - remote punch/session/post work is serialized by `_timesheetSessionLock`
 
 Reason:
@@ -183,6 +185,7 @@ Behavior notes:
 - When `punchDt` is omitted, normal rounding-to-workday behavior may apply.
 - `punchIn/punchOut` return thread handles; callers may `join()` when ordering matters.
 - `initializePunchSession(...)` now also updates `timesheetDateKey`.
+- `initializePunchSession(...)` also refreshes and caches charge-code models for that specific `timesheetDateKey`.
 - `startTask`, `deleteTaskPrompt`, and `clearDayData` now use `_ensureCurrentDayContext(...)` so user actions cannot bypass midnight rollover.
 
 
