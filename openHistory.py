@@ -142,23 +142,42 @@ def openHistory(self):
             p["total"] = total
 
         # Synthetic overview used only when the user explicitly asks for an
-        # all-history stacked area chart.
-        totalOverview = {"days": [], "agg": {}, "total": 0.0}
+        # all-history stacked area chart. Weekend work is treated as overtime
+        # against the preceding Friday so it does not create low weekend points.
+        totalOverview = {"days": [], "agg": {}, "total": 0.0, "dayAgg": {}, "sourceDayCount": 0}
+
+        def totalOverviewWorkdayKey(d):
+            if d.weekday() == 5:
+                return d - timedelta(days=1)
+            if d.weekday() == 6:
+                return d - timedelta(days=2)
+            return d
 
         def recomputeTotalOverview():
             agg = {}
             total = 0.0
+            dayAggByWorkday = {}
             days = sorted({dStr for p in periods for dStr in p.get("days", [])})
 
             for dStr in days:
+                try:
+                    workdayKey = totalOverviewWorkdayKey(date.fromisoformat(dStr)).isoformat()
+                except ValueError:
+                    workdayKey = dStr
+
                 dayAgg, dayTotal = parseDaySummary(dStr)
+                workdayEntry = dayAggByWorkday.setdefault(workdayKey, {"agg": {}, "total": 0.0})
                 for k, v in dayAgg.items():
                     agg[k] = agg.get(k, 0.0) + v
+                    workdayEntry["agg"][k] = workdayEntry["agg"].get(k, 0.0) + v
+                workdayEntry["total"] += dayTotal
                 total += dayTotal
 
-            totalOverview["days"] = days
+            totalOverview["days"] = sorted(dayAggByWorkday.keys())
             totalOverview["agg"] = agg
             totalOverview["total"] = total
+            totalOverview["dayAgg"] = dayAggByWorkday
+            totalOverview["sourceDayCount"] = len(days)
 
         recomputeTotalOverview()
 
@@ -764,6 +783,7 @@ def openHistory(self):
             seriesAgg = []
             seriesLabels = []
             maxSeriesTotal = 0.0
+            dayAggOverride = period.get("dayAgg", {}) if isinstance(period, dict) else {}
 
             for startIdx in range(0, len(days), bucketSize):
                 bucketDays = days[startIdx:startIdx + bucketSize]
@@ -771,7 +791,12 @@ def openHistory(self):
                 bucketTotal = 0.0
 
                 for dStr in bucketDays:
-                    dayAgg, dayTotal = parseDaySummary(dStr)
+                    overrideEntry = dayAggOverride.get(dStr)
+                    if isinstance(overrideEntry, dict):
+                        dayAgg = overrideEntry.get("agg", {}) or {}
+                        dayTotal = float(overrideEntry.get("total", 0.0) or 0.0)
+                    else:
+                        dayAgg, dayTotal = parseDaySummary(dStr)
                     for k, v in dayAgg.items():
                         bucketAgg[k] = bucketAgg.get(k, 0.0) + v
                     bucketTotal += dayTotal
@@ -1182,7 +1207,7 @@ def openHistory(self):
             if subtitleLabel is not None and subtitleLabel.winfo_exists():
                 usedBucket = int(meta.get("bucketSize", bucketSize))
                 pointCount = int(meta.get("pointCount", 0))
-                dayCount = int(meta.get("dayCount", len(totalOverview.get("days", []))))
+                dayCount = int(totalOverview.get("sourceDayCount", meta.get("dayCount", len(totalOverview.get("days", [])))))
                 if usedBucket <= 1:
                     subtitleText = f"Smoothed stacked area ({pointCount} points)"
                 else:
