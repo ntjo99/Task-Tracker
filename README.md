@@ -1,38 +1,26 @@
 # Task Tracker
-##### A simple program that allows you to track your time spent on tasks.    
 
-### History
-- In the top right of the app there is a button labelled `History`. This will show you summaries of your previous times.  
-- It will show summaries for daily times recorded, as well as cumulative times spent for pay periods.  
-- Pay Periods are hardcoded for the start date. They are 2 weeks long. If you wish to alter this, you will have to change the internal code. I have no current plans to make this process easy. 
+Simple desktop task timing with local history and optional Hour Timesheet sync.
 
-### Edit
-- In the history window you can edit a day's times.
-- You can drag, move and stretch times.
-- Left click to create a time, right click to delete it.
-- Times will snap to set work hours.
+## Features
+- Task timing: start a task by clicking it, switch tasks at any time, and stop the active task by clicking it again.
+- Retro clock-in: add recent missed time to a selected task.
+- Fix Recent: move the currently selected recent block to another task or charge code.
+- History: view saved daily summaries and pay-period rollups.
+- Day editing: edit a saved day by dragging, resizing, creating, or deleting timeline blocks.
+- Groups: group related tasks for cleaner history summaries and shared color families.
+- Settings: configure work hours, rounding, colors, groups, and timesheet options.
+- Hour Timesheet integration: optional punch in/out and charge-code syncing.
+- Charge codes: map tasks or groups to charge codes and sync final saved day totals.
+- Local persistence: tasks, history, groups, and charge-code data are stored locally.
 
-### Example JSON
-- I have included tasks.example.jsonl with example data so you can see the full features of the history summaries.
-- The app no longer auto-loads or copies this file. New installs start blank, and tasks.jsonl is created on first save.
-- This file can be deleted without any concern.
+## Data
+- Normal runtime data lives in `%LOCALAPPDATA%\Task Tracker`.
+- Source testing can use a local folder through the dev switches in `timesheet.py`.
 
-### Groups
-- This app has a feature to add groups. This is purely cosmetic for history purposes. Tasks you group together will show a both individual and combined times in the summaries.  
-- You will see them individually graphed, but they will have a similar base color.  
-- You can create groups in the history section on the far right side. Use `CTRL` or `SHIFT` to select multiple tasks at a time, and then right above `Set Group`, type the name of the group you want to create.
+## Build
+```powershell
+pyinstaller --clean timesheet.spec
+```
 
-### Settings
-- Theres an icon next to the `clear` button that will open settings.
-- Work hours are purely for rounding purposes, with rounding enabled the buffer zone to round to work hours is 5 minutes.
-- If using timesheet functionality, set groups or tasks to assocaite with a charge code.
-
-### Timesheet
-- This app works with hourtimesheet.com. When enabled, and credentials saved in settings, it will punch you in when you start your first task of the day, and punch you out when you save times, as well as post times to the application.
-- This is a little brittle so don't expect this to work perfectly all the time.
-- In order to gather charge codes, it relies on your previous charge codes from the last pay period. It is recommended to put all charge codes you think you may want in the pay period before you use the app. Enter a 0 for charge codes you didn't use but may want in the future.
-
-## Installer Command
-`pyinstaller --onefile --windowed --icon=hourglass.ico --add-data "hourglass.ico;." timesheet.py`
-
-
+Installer packaging is in `setup.iss`.

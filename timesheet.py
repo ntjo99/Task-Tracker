@@ -1348,6 +1348,41 @@ class TaskTrackerApp:
         totals = self._collectTaskSecondsFromTimeline(self.dayTimeline)
         self.tasks = {name: float(totals.get(name, 0.0) or 0.0) for name in self.rows.keys()}
 
+    def _currentSelectedWindowStart(self):
+        if self.currentTask is None or self.currentStart is None:
+            return None
+
+        try:
+            cursor = float(self.currentStart)
+        except Exception:
+            return None
+
+        matchingSegments = []
+        for seg in self.dayTimeline:
+            rng = self._segmentTsRange(seg)
+            if rng is None:
+                continue
+            if str(seg.get("task", "") or "").strip() != self.currentTask:
+                continue
+            matchingSegments.append((rng[0], rng[1]))
+
+        matchingSegments.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        toleranceSeconds = 1.0
+
+        changed = True
+        while changed:
+            changed = False
+            for startTs, endTs in matchingSegments:
+                if abs(endTs - cursor) > toleranceSeconds:
+                    continue
+                if startTs >= cursor:
+                    continue
+                cursor = startTs
+                changed = True
+                break
+
+        return cursor
+
     def retroClockIn(self):
         now = time.time()
         self._ensureCurrentDayContext(now)
@@ -1411,7 +1446,12 @@ class TaskTrackerApp:
             messagebox.showinfo("Fix Recent Time", "Select an active task before fixing recent time.")
             return
 
-        availableSeconds = max(0.0, now - float(self.currentStart))
+        selectedWindowStart = self._currentSelectedWindowStart()
+        if selectedWindowStart is None:
+            messagebox.showinfo("Fix Recent Time", "There is no active selected time to reassign yet.")
+            return
+
+        availableSeconds = max(0.0, now - float(selectedWindowStart))
         if availableSeconds <= 0.0:
             messagebox.showinfo("Fix Recent Time", "There is no active selected time to reassign yet.")
             return
