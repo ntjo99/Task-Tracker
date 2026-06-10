@@ -124,7 +124,7 @@ Path:
   - closes active segment
   - merge policy prompt (`append/overwrite/cancel`)
   - `_saveTimelineForDate(dayKey, dayTimeline, mergeChoice)` builds a merged save plan
-  - `_postAfterPunchOut(postTaskSecondsSnapshot, dateKey=dayKey)` now syncs the final full-day mapped charge-code totals for that date
+  - `_postAfterPunchOut(postTaskSecondsSnapshot, dateKey=dayKey)` posts the final mapped charge-code totals for that date after punch out
   - clears in-memory day session state
 
 ### B2) Retroactive time tools
@@ -186,12 +186,9 @@ Path:
 - `_queueChargeCodePost(snapshot, dateKey)` appends queue item
 - `updateLoop()` drains `_pendingChargePosts` and calls:
   - `postChargeCodeHours(snapshot, dateKey=item.dateKey)`
-- `postChargeCodeHours(...)` rebinds the posting session to `dateKey` before syncing when needed
+- `postChargeCodeHours(...)` rebinds the posting session to `dateKey` before posting when needed
 - `postChargeCodeHours(...)` should use the charge-code cache for that exact `dateKey`, not only the latest JSONL refresh
-- `postChargeCodeHours(...)` now treats the payload as a full-day sync:
-  - posts every loaded charge-code key for that date
-  - includes `0.0` writes so removed/reassigned codes get cleared remotely
-  - relies on the remote API overwriting prior values for the same charge code/date
+- `postChargeCodeHours(...)` posts only mapped charge codes with time for that date
 - remote punch/session/post work is serialized by `_timesheetSessionLock`
 
 Reason:

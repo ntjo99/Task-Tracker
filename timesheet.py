@@ -2582,15 +2582,15 @@ class TaskTrackerApp:
                 mappedTotal = round(sum(hoursByKey.values()), 1)
 
                 if hadError:
-                    queueUi(lambda: self.showToast("Synced charge codes (some failed)", error=True))
+                    queueUi(lambda: self.showToast("Posted charge codes (some failed)", error=True))
                 elif unmappedHours > 0:
                     queueUi(lambda: self.showToast(
-                        f"Synced {postedCount} charge codes ({mappedTotal:.1f}h mapped, {unmappedHours:.1f}h unmapped, day total {targetTotal:.1f}h)",
+                        f"Posted {postedCount} charge codes ({mappedTotal:.1f}h mapped, {unmappedHours:.1f}h unmapped, day total {targetTotal:.1f}h)",
                         timeout=5000,
                         error=True
                     ))
                 else:
-                    queueUi(lambda: self.showToast(f"Synced {postedCount} charge codes"))
+                    queueUi(lambda: self.showToast(f"Posted {postedCount} charge codes"))
 
             except Exception:
                 queueUi(lambda: self.showToast("Error posting charge codes", error=True))
@@ -3090,7 +3090,7 @@ class TaskTrackerApp:
             self._canonicalKey(key): key for key in chargeCodesByKey.keys()
         }
 
-        hoursByKey = {key: 0.0 for key in chargeCodesByKey.keys()}
+        hoursByKey = {}
         unmappedByTask = {}
 
         for taskName, hours in roundedTaskHours.items():
@@ -3168,18 +3168,11 @@ class TaskTrackerApp:
             f"Mapped: {mappedTotal:.1f} h",
             f"Unmapped: {unmappedTotal:.1f} h",
             "",
-            "Charge code sync:",
+            "Charge codes to post:",
         ]
 
-        zeroCount = 0
         for key, hours in sorted(hoursByKey.items(), key=lambda kv: kv[0].lower()):
-            if hours <= 0:
-                zeroCount += 1
-                continue
             lines.append(f"  {key}: {hours:.1f} h")
-
-        if zeroCount:
-            lines.append(f"  {zeroCount} loaded charge codes will be set to 0.0 h")
 
         if unmappedByTask:
             lines.append("")
@@ -3188,7 +3181,7 @@ class TaskTrackerApp:
                 lines.append(f"  {task}: {hours:.1f} h")
 
         lines.append("")
-        lines.append("Sync charge codes now?")
+        lines.append("Post charge codes now?")
         return messagebox.askyesno("Review Charge Codes", "\n".join(lines))
 
     def _updateSessionStatusStrip(self):
